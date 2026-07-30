@@ -12,14 +12,19 @@
  * condition the user cannot and need not act on.
  *
  * So the banner now renders NOTHING while a delivery route exists. It speaks up
- * in exactly one failure case: the reader is unreachable AND no mailbox is
- * configured, i.e. a composed note has nowhere to go. That IS actionable, and
- * the copy points at the one place that fixes it (Settings).
+ * in exactly one failure case: NO ROUTE AT ALL, i.e. a composed note has nowhere
+ * to go. That IS actionable, and the copy points at the one place that fixes it
+ * (Settings).
  *
- * Compose's own send gate keeps explaining the mailbox route in the normal
- * "asleep reader" case (see ComposeScreen's `canSend` / `mailboxReady`), and
- * Settings' connection card keeps showing plain connection state — neither
- * needs a global banner repeating it.
+ * "A route exists" is no longer this component's own opinion. It asks
+ * `useDeliverability`, which counts all three roads — direct, mailbox AND a
+ * saved reader-AP passphrase (Sync-with-reader). The mailbox-only version of
+ * this test used to shout at a phone that was perfectly capable of handing its
+ * outbox over at the next sync. Same truth table, one more true cell.
+ *
+ * Compose's route chip names the road in the normal "asleep reader" case, and
+ * Settings' connection card keeps showing plain connection state — neither needs
+ * a global banner repeating it.
  *
  * Device + Wallpaper genuinely require a DIRECT connection (there is no mailbox
  * route for a file browser). They keep their own inline disabled states; this
@@ -56,18 +61,15 @@ import React, { useCallback, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useConnection } from '../contexts/ConnectionProvider';
-import { getCurrentIp } from '../services/settings';
-import { getRole } from '../services/role';
-import { isMailboxConfigured, type LoveNoteDestination } from '../services/love_note_sender';
+import { useDeliverability } from '../services/useDeliverability';
 import { useTheme, type Theme } from '../theme';
 import { SettingsIcon } from './icons';
 
 /** Matches the old inline `fontSize: 20` gear the SVG replaces. */
 const SETTINGS_ICON_SIZE = 20;
 
-/** The one banner message left. Warm, and it names the fix. */
-const NO_ROUTE_MESSAGE =
-    "Can't reach the reader and no mailbox is set up — notes can't be delivered yet.";
+/** The one banner message left. Short, warm, and it names the fix. */
+const NO_ROUTE_MESSAGE = 'Notes have nowhere to go yet.';
 
 /**
  * Composite a translucent `rgba(r,g,b,a)` tint onto an opaque hex background.
@@ -96,18 +98,39 @@ function flattenTint(tint: string, overHex: string): string {
     return `#${channel(0)}${channel(1)}${channel(2)}`;
 }
 
+/**
+ * The one caption a direct-only surface is allowed to render when it is off.
+ *
+ * Two words, no colour, no call to action. The reader sleeping with its radio
+ * off is the DEFAULT state of this product, not an incident, and the screen has
+ * already said everything actionable by greying the control out. The paragraph
+ * this replaced ("This needs a direct connection to the reader — wake it and
+ * join its Wi-Fi") explained a precondition the user cannot satisfy on demand
+ * and had already met or not.
+ */
+export const READER_ASLEEP_CAPTION = 'Reader asleep';
+
 /** What a direct-connection-only surface needs to know. */
 export interface DirectConnectionRequirement {
     /** True when the reader answered the last probe — direct-only features work. */
     available: boolean;
+    /**
+     * The STRICT reading: the reader answered AND that answer is still inside
+     * `reader_reachability`'s freshness window.
+     *
+     * NOT what `available` is built on, on purpose — see the hook. Exposed so a
+     * surface whose action is expensive or destructive can opt into the stricter
+     * test without re-deriving it.
+     */
+    directNow: boolean;
     /** True while a probe is in flight. */
     checking: boolean;
-    /**
-     * Null when `available`. Otherwise a calm, screen-agnostic reason — the
-     * reader being asleep is not an incident, so this is worded as a
-     * precondition, not an error.
-     */
-    reason: string | null;
+    // NO `reason` FIELD. It returned `available ? null : READER_ASLEEP_CAPTION`
+    // and not one of the three call sites ever read it — Device, Wallpaper and
+    // History each import {@link READER_ASLEEP_CAPTION} and render it directly,
+    // which is the same one wording from the same one constant. A field that
+    // only a comment claims is load-bearing is worse than no field: it reads as
+    // a wired-up affordance to the next person to touch this hook.
     /** The transport's own last message, VERBATIM, or undefined. */
     lastError?: string;
     /** Re-probe now. Intended for a user-initiated control only. */
@@ -118,31 +141,48 @@ export interface DirectConnectionRequirement {
  * Shared truth for the Device/Wallpaper class of screen: features that talk to
  * the reader's HTTP API directly and have no mailbox fallback.
  *
- * Exported for those screens to adopt (they currently re-derive this inline);
- * the banner uses the same underlying values so a screen and the shell can never
- * disagree about whether direct access exists.
+ * ---------------------------------------------------------------------------
+ * WHY `available` IS THE UN-DECAYED `connected`, NOT `directNow`
+ * ---------------------------------------------------------------------------
+ * `directNow` is `connected` AND-ed with a 30 SECOND freshness window, and
+ * `useDeliverability` holds no timer — it recomputes on settings changes, app
+ * foreground and user-driven re-checks, and nothing else. Gating the file
+ * browser on it would therefore grey out every folder, every delete and the
+ * wallpaper upload roughly half a minute after each probe, on a reader that is
+ * sitting there awake and answering, and un-grey them on the next foreground.
+ * That is a control flickering on the CLOCK rather than on the world — strictly
+ * worse than the state it replaced.
+ *
+ * Freshness earns its keep in the ROUTING decision, where a stale observation
+ * must not be allowed to promise 'direct'; it does not earn its keep in an
+ * enable/disable gate, where the failure mode of being wrong is one honest error
+ * message from a request the user chose to make.
+ *
+ * The right fix, if a surface ever needs decay here, is periodic re-probing in
+ * ConnectionProvider so the whole app decays together. Until that exists,
+ * `directNow` is offered alongside rather than substituted in.
  */
 export function useDirectConnectionRequired(): DirectConnectionRequirement {
     const { connectionStatus, checkConnection } = useConnection();
+    const { directNow } = useDeliverability();
 
     return useMemo(
         () => ({
             available: connectionStatus.connected,
+            directNow,
             checking: connectionStatus.checking,
-            reason: connectionStatus.connected
-                ? null
-                : 'This needs a direct connection to the reader — wake it and join its Wi-Fi.',
             lastError: connectionStatus.lastError,
             recheck: () => {
                 void checkConnection();
             },
         }),
-        [connectionStatus, checkConnection]
+        [connectionStatus, directNow, checkConnection]
     );
 }
 
 export function ConnectionBanner() {
-    const { connectionStatus, checkConnection, settings } = useConnection();
+    const { connectionStatus, checkConnection } = useConnection();
+    const { anyRoute } = useDeliverability();
     const navigation = useNavigation<any>();
     const theme = useTheme();
     const styles = useMemo(() => createStyles(theme), [theme]);
@@ -164,19 +204,6 @@ export function ConnectionBanner() {
     const openSettings = useCallback(() => {
         navigation.navigate('Settings');
     }, [navigation]);
-
-    // Same object shape and the same predicate Compose's send gate uses, so the
-    // banner cannot claim a note has nowhere to go while Send is enabled.
-    const destination = useMemo<LoveNoteDestination>(
-        () => ({
-            role: getRole(settings),
-            ip: getCurrentIp(settings),
-            mailboxUrl: settings.mailboxUrl,
-            mailboxWriteToken: settings.mailboxWriteToken,
-        }),
-        [settings]
-    );
-    const hasMailboxRoute = isMailboxConfigured(destination);
 
     const settingsButton = (
         <TouchableOpacity
@@ -230,9 +257,10 @@ export function ConnectionBanner() {
         );
     }
 
-    // 3. Unreachable WITH a mailbox route — the normal, covered state. Silence.
-    //    Compose's send gate already explains that notes go via the mailbox.
-    if (hasMailboxRoute) return null;
+    // 3. Unreachable but SOME road exists — mailbox, or a saved AP passphrase to
+    //    hand the outbox over at the next sync. The normal, covered state.
+    //    Silence. Compose's route chip already names which road.
+    if (anyRoute) return null;
 
     // 4. Unreachable and NO route at all: a composed note has nowhere to go.
     //    The only genuinely actionable state, and the only one that earns a tint.

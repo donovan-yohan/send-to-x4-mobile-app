@@ -38,7 +38,12 @@ import java.util.Locale
  */
 internal class HttpProtocolException(val status: Int, val reason: String) : IOException(reason)
 
-internal enum class TargetKind { HEALTH, FORWARD }
+/**
+ * WIFI is a LOCAL ONLY target, like HEALTH: it is answered from this process and can never become
+ * a forward. It is listed before FORWARD here and matched before it in [HttpWire.classifyTarget]
+ * because that ordering is the invariant, not a style choice — see [ProxyContract.WIFI_PATH].
+ */
+internal enum class TargetKind { HEALTH, WIFI, FORWARD }
 
 internal data class ProxyRequest(
   val method: String,
@@ -141,13 +146,23 @@ internal object HttpWire {
     if (!version.startsWith("HTTP/1.")) {
       throw HttpProtocolException(505, "unsupported HTTP version")
     }
+    // SYNTAX BEFORE METHOD, so a percent escape or a traversal segment is refused before anything
+    // downstream looks at the path — including the one method gate below that does.
+    validateTargetSyntax(target)
     // GET|HEAD only. A3: "accept GET and HEAD on /m/* and nothing else ... The reader never
     // publishes — HttpDownloader only ever issues GET". A write reaching the mailbox through
     // this module is impossible by construction, not by policy.
+    //
+    // DELETE IS THE ONE EXCEPTION AND IT IS PINNED TO ONE LITERAL LOCAL PATH. The WiFi handover
+    // needs an ack, and an ack is a write; without one the phone would go on offering a passphrase
+    // the reader already holds. It is admitted here ONLY for ProxyContract.WIFI_PATH, which
+    // classifyTarget answers locally and which no forward prefix can ever reach, so the mailbox
+    // still cannot see a method other than GET or HEAD from this module. Every other target,
+    // including /cp-proxy and everything under the forward prefix, still refuses it.
     if (method != "GET" && method != "HEAD") {
-      throw HttpProtocolException(405, "method not allowed")
+      val wifiAck = method == "DELETE" && pathOf(target) == ProxyContract.WIFI_PATH
+      if (!wifiAck) throw HttpProtocolException(405, "method not allowed")
     }
-    validateTargetSyntax(target)
 
     var range: String? = null
     var headerCount = 0
@@ -244,6 +259,11 @@ internal object HttpWire {
   fun classifyTarget(target: String, forwardPrefix: String): TargetKind {
     val path = pathOf(target)
     if (path == ProxyContract.HEALTH_PATH) return TargetKind.HEALTH
+    // BEFORE THE FORWARD TEST, and that is the whole of the "never forwarded" guarantee for the
+    // WiFi handover: whatever prefix a session was configured with, an exact match on this literal
+    // path has already been answered locally by the time the prefix is consulted. Both local paths
+    // are exact-match, so neither can be shadowed by a longer prefix either.
+    if (path == ProxyContract.WIFI_PATH) return TargetKind.WIFI
     if (path.length > forwardPrefix.length && path.startsWith(forwardPrefix)) {
       return TargetKind.FORWARD
     }

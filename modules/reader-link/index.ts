@@ -33,7 +33,11 @@
  * iOS), so callers check {@link isReaderLinkAvailable} first instead of crashing at import time.
  *
  * WHAT THE NATIVE SIDE WILL NEVER DO — relied on by callers, enforced in Kotlin:
- *   - forward anything but `GET`/`HEAD` on `/m/*` (plus the local `/cp-proxy` health answer),
+ *   - forward anything but `GET`/`HEAD` on `/m/*`. Two paths are answered LOCALLY and are never
+ *     forwarded, never fetched upstream and never reachable through any `allowedPathPrefix`: the
+ *     `/cp-proxy` health answer, and the opt-in `/cp-wifi` handover (see
+ *     {@link StartProxyOptions.wifiSharePath}), which is also the only path that accepts a method
+ *     other than GET/HEAD — a `DELETE`, which is the reader's ack,
  *   - attach an `Authorization` header, or accept one from the peer link. The mailbox write token
  *     never crosses this boundary; there is no parameter here that could carry it,
  *   - read a file outside this app's own storage, or take a body over the bridge. See
@@ -171,6 +175,22 @@ export type StartProxyOptions = {
      * queued the old behaviour is unchanged.
      */
     outboxManifestPath?: string;
+    /**
+     * Absolute path (or `file://` URI) of the two-line WiFi credential the phone is handing to the
+     * reader — `prepareWifiShareHandover()` in `src/services/wifi_share.ts`. Omit it and the
+     * local-only `/cp-wifi` endpoint does not exist for the session: every method on it 404s.
+     *
+     * OPT-IN, AND THAT IS THE SECURITY PROPERTY. This is the only endpoint in the module that
+     * serves a secret, and the peer link is reachable by anything that associates with the
+     * reader's AP, so a session that was not explicitly asked to share a network must not be
+     * talkable into it.
+     *
+     * A PATH, NEVER THE VALUES, exactly like {@link outboxManifestPath}: native opens the file
+     * itself, confines it to this app's own storage, and DELETES it when the reader acks with
+     * `DELETE /cp-wifi`. A passphrase passed as an option field would sit in a record that a
+     * validation message or an options dump could echo.
+     */
+    wifiSharePath?: string;
 };
 
 export type StartProxyResult = {
@@ -230,6 +250,16 @@ export type ReaderLinkStatus = {
         deliveredIds: string[];
         bytesServed: number;
         startedOffline: boolean;
+    };
+    /**
+     * The WiFi handover's reconcile channel. TWO BOOLEANS ONLY — no SSID, no passphrase: a status
+     * snapshot is exactly the sort of object that ends up pasted into a bug report.
+     */
+    wifi: {
+        /** False when `startProxy` was called without `wifiSharePath`; `/cp-wifi` then 404s. */
+        enabled: boolean;
+        /** True once the reader acked. Survives `stopProxy` until the next `startProxy`. */
+        delivered: boolean;
     };
     link: {
         state: ReaderLinkLinkStatusState;
@@ -356,12 +386,32 @@ export type SessionEndEvent = {
     message?: string | null;
 };
 
+/**
+ * The WiFi handover, as a state word AND NOTHING ELSE.
+ *
+ * There is no ssid field and no passphrase field here, and that is not an omission: the native
+ * emit takes a single `String`, so there is no shape in which a credential could ride this event.
+ * `/cp-wifi` requests produce no {@link ProxyActivityEvent} either, so this is the only trace one
+ * leaves anywhere.
+ *
+ * - `served` — the credential went out on a `GET`. The reader has the bytes; it has not said it
+ *   saved them, so the phone must keep holding the passphrase.
+ * - `delivered` — the reader acked with `DELETE /cp-wifi`. Native has already removed the staged
+ *   file by the time this arrives; this is what the JS half wipes its own staging on.
+ */
+export type WifiShareState = 'served' | 'delivered';
+
+export type WifiShareEvent = {
+    state: WifiShareState;
+};
+
 export type ReaderLinkModuleEvents = {
     onLinkState: (event: LinkStateEvent) => void;
     onProxyState: (event: ProxyStateEvent) => void;
     onProxyActivity: (event: ProxyActivityEvent) => void;
     onSessionEnd: (event: SessionEndEvent) => void;
     onLocalDelivery: (event: LocalDeliveryEvent) => void;
+    onWifiShare: (event: WifiShareEvent) => void;
 };
 
 declare class ReaderLinkNativeModule extends NativeModule<ReaderLinkModuleEvents> {
@@ -461,6 +511,17 @@ export function addLocalDeliveryListener(
     listener: (event: LocalDeliveryEvent) => void
 ): EventSubscription {
     return subscribe('onLocalDelivery', listener);
+}
+
+/**
+ * Fires on `served` and again on the reader's `delivered` ack. Wipe the staged credential on
+ * `delivered` and NOT on `served`: the reader having the bytes is not the reader having saved
+ * them, and the phone is the only copy left.
+ */
+export function addWifiShareListener(
+    listener: (event: WifiShareEvent) => void
+): EventSubscription {
+    return subscribe('onWifiShare', listener);
 }
 
 /** Escape hatch for anything this wrapper has not typed yet. Null when unavailable. */

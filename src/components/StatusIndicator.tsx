@@ -48,12 +48,15 @@ export function StatusIndicator({ status, onRetry }: StatusIndicatorProps) {
                 Role: {status.role === 'host' ? 'Host (paired with reader)' : 'Client (sends via mailbox)'}
             </Text>
 
-            {/* `lastError` VERBATIM — the transport's own message, url and all. */}
-            {!status.connected && !status.checking && (
-                <Text style={styles.helpText}>
-                    {status.lastError ? `Error: ${status.lastError}` : "Join the reader's WiFi to send files"}
-                </Text>
-            )}
+            {/* `lastError` VERBATIM — the transport's own message, url and all.
+                The FALLBACK is gone: "Join the reader's WiFi to send files" was
+                both redundant (the line above already says the reader can't be
+                reached) and, for notes and books, FALSE — those travel by
+                mailbox or by handover with the reader nowhere in sight. With no
+                error to report there is nothing here worth a second line. */}
+            {!status.connected && !status.checking && status.lastError ? (
+                <Text style={styles.helpText}>{`Error: ${status.lastError}`}</Text>
+            ) : null}
         </View>
     );
 }

@@ -104,7 +104,7 @@ import { useProgress } from '../contexts/ProgressProvider';
 import type { RemoteFile } from '../types';
 import { getCurrentIp, getDeviceBaseUrl } from '../services/settings';
 import { deleteCrossPointFile } from '../services/crosspoint_upload';
-import { LOVE_NOTES_DIR, isMailboxConfigured } from '../services/love_note_sender';
+import { LOVE_NOTES_DIR } from '../services/love_note_sender';
 import {
     DEFAULT_LIBRARY_FOLDER,
     MAILBOX_LANDING_CLAUSE,
@@ -141,7 +141,11 @@ import { getRole, isHost } from '../services/role';
 import { SLEEP_SET_FOLDER } from '../services/wallpaper_sender';
 import { getPreviewMapping, removePreviewMapping } from '../services/preview_cache';
 import { ProcessingOverlay } from '../components/ProcessingOverlay';
+import { RouteChip } from '../components/RouteChip';
+import { READER_ASLEEP_CAPTION, useDirectConnectionRequired } from '../components/ConnectionBanner';
 import { BinIcon, DeviceIcon } from '../components/icons';
+import { summarizeRoute } from '../services/deliverability';
+import { useDeliverability } from '../services/useDeliverability';
 import { useTabBarInset, useTheme, type Theme } from '../theme';
 
 /** Empty-state / gate-card mark. */
@@ -437,8 +441,20 @@ export function DeviceScreen() {
     // list has to end above it. See src/theme/tabBar.ts.
     const tabBarInset = useTabBarInset();
 
-    const connected = connectionStatus.connected;
+    /**
+     * DIRECT ONLY, and only for the direct-only halves of this tab: the raw file
+     * browser, the delete-from-reader path and the reader side of the merged
+     * listing. Adding a book is NOT gated on this — see `canAddBooks`.
+     */
+    const { available: connected } = useDirectConnectionRequired();
     const host = isHost(settings);
+
+    /**
+     * The shared roads model. Books read `bookRoute`, not `summary` — see the
+     * note on the chip in the header.
+     */
+    const deliverability = useDeliverability();
+    const bookSummary = summarizeRoute(deliverability.bookRoute);
 
     /**
      * The four facts every route depends on, in one object.
@@ -458,10 +474,13 @@ export function DeviceScreen() {
         [settings]
     );
 
-    // The DECISION is the sender's, not re-derived here: a screen that disagreed
-    // with `routeEpubSend` about whether a mailbox is usable would offer an Add
-    // that cannot work, or hide one that can.
-    const mailboxConfigured = useMemo(() => isMailboxConfigured(destination), [destination]);
+    // NOTE: this screen no longer keeps an `isMailboxConfigured(destination)` of
+    // its own. Both things it fed now come from a shared answer instead — the Add
+    // gate from `deliverability.bookRoute` and the Sync gate from
+    // `deliverability.apHandoverReady` — because a screen-local copy of a routing
+    // predicate is exactly how the two drifted apart in the first place. The
+    // "is the mailbox usable" line under the title reads the SNAPSHOT's flag,
+    // which is the loader's own answer about the box it actually talked to.
 
     /**
      * What the app already knows about whether the reader is answering.
@@ -761,14 +780,21 @@ export function DeviceScreen() {
     // ── Add books ───────────────────────────────────────────────────
 
     /**
-     * The one WRITE that creates rows.
+     * The one WRITE that creates rows. It needs a ROAD, not a reachable reader.
      *
-     * NOT gated on the reader being reachable: `sendEpubsRouted` falls back to
-     * the mailbox when the reader does not answer, and the reader is asleep most
-     * of the time — so a host with a mailbox can always add a book. Host is
-     * still checked here rather than trusted from App.tsx's tab gate.
+     * NOT gated on the reader answering: `sendEpubsRouted` falls back to the
+     * mailbox when it does not, and the reader is asleep most of the time. Was
+     * `host && (connected || mailboxConfigured)`, which is the same road
+     * ComposeScreen's send gate was missing: a host whose mailbox base is
+     * serveable but whose write token is missing got NO Add button, while
+     * `routeEpubSend` parks the epub in the outbox and the next Sync-with-reader
+     * hands it over — the button hidden precisely when the feature it drives was
+     * the only thing that would have worked.
+     *
+     * `bookRoute`, because this adds books. `host` is still checked here rather
+     * than trusted from App.tsx's tab gate.
      */
-    const canAddBooks = host && (connected || mailboxConfigured);
+    const canAddBooks = host && deliverability.bookRoute !== 'none';
 
     /**
      * Which file the batch is on, so a PHASE line can keep the "3/7: Dune.epub"
@@ -1055,12 +1081,11 @@ export function DeviceScreen() {
                 return;
             }
 
-            // On the reader, no reader. Not an error — just not now.
+            // On the reader, no reader. Not an error — just not now. KEPT (the
+            // user just tapped the bin), trimmed to the one fact the title does
+            // not already carry.
             if (onReader) {
-                Alert.alert(
-                    'Reader Asleep',
-                    "Join the reader's WiFi to remove a book from the card."
-                );
+                Alert.alert('Reader asleep', 'This book can only be removed with the reader awake.');
                 return;
             }
 
@@ -1177,9 +1202,11 @@ export function DeviceScreen() {
         if (libraryLoading || !snapshot) return null;
         if (readerFresh) return null;
         if (readerListedAt) {
-            return `Reader asleep — books on the card are from ${formatRelativeTime(readerListedAt, now)}.`;
+            // The TIMESTAMP is the information — it says how much to trust the
+            // list below. The instruction that used to follow it is gone.
+            return `${READER_ASLEEP_CAPTION} — card listed ${formatRelativeTime(readerListedAt, now)}.`;
         }
-        return "Reader asleep — nothing listed from it yet. Join its WiFi to see what's on the card.";
+        return `${READER_ASLEEP_CAPTION} — nothing listed from the card yet.`;
     }, [libraryLoading, snapshot, readerFresh, readerListedAt, now]);
 
     /**
@@ -1203,7 +1230,10 @@ export function DeviceScreen() {
         // the second is worth a line.
         if (!snapshot.mailboxConfigured) {
             if (readerFresh) return null;
-            return 'No mailbox set up — set one up in Settings to add books while the reader sleeps.';
+            // The route chip beside the title already carries "Set up" and is
+            // the one pointer at Settings on this screen, so this line no longer
+            // repeats the instruction — it only names the missing half.
+            return 'No mailbox set up.';
         }
         if (mailboxOk) return null;
         return `Mailbox unavailable — ${snapshot.mailboxError || 'could not read the queue.'}`;
@@ -1213,16 +1243,26 @@ export function DeviceScreen() {
     const rowsBusy = busyBook !== null || addingBooks || deleteLoading !== null;
 
     /**
-     * Offered when there is a mailbox to forward to, and to a host only.
+     * Offered when there is a mailbox this phone can SERVE, and to a host only.
+     *
+     * `deliverability.apHandoverReady`, not a predicate of its own. It used to be
+     * `host && mailboxConfigured`, which was wrong twice: too strict, because the
+     * write token is deliberately never handed to the proxy, so a missing token
+     * hid a sync that would have worked; and unshared, so the model went on
+     * promising 'Next sync' from a saved AP passphrase while this button — the
+     * only thing that can drain the outbox — was not on the screen at all.
+     *
+     * The real constraint is unchanged and now lives in `isHandoverAvailable`: a
+     * proxy with no upstream would join the reader's AP, drop the phone off its
+     * own WiFi and serve 502s, so the base must be one `describeProxyTarget`
+     * accepts. `sync_session.start` enforces exactly that a moment later.
      *
      * NOT gated on the native module being present. A build without it is the
      * normal state until the next native rebuild, and the button's own status line
      * says exactly that — which is far more useful than a feature that silently
-     * does not exist. Gated on `mailboxConfigured` because a proxy with no
-     * upstream would join the reader's AP, drop the phone off its own WiFi, and
-     * serve 502s.
+     * does not exist.
      */
-    const canSyncWithReader = host && mailboxConfigured;
+    const canSyncWithReader = deliverability.apHandoverReady;
 
     return (
         <View style={styles.container}>
@@ -1237,11 +1277,19 @@ export function DeviceScreen() {
                     />
                 }
             >
-                <Text style={styles.title}>Library</Text>
-                <Text style={styles.subtitle}>
-                    Every book you've sent — on the reader, or waiting in the mailbox
-                    until it wakes.
-                </Text>
+                <View style={styles.titleRow}>
+                    <Text style={styles.title} numberOfLines={1}>Library</Text>
+                    {/* WHERE THE NEXT BOOK GOES, in a word. Replaces the
+                        subtitle ("Every book you've sent — on the reader, or
+                        waiting in the mailbox until it wakes"), which was
+                        describing the same routing in prose AND asserting it
+                        unconditionally, on a phone that might have neither road.
+                        `bookRoute`, not `summary`: books are what this tab
+                        sends. The two agree today and a test pins that, but
+                        reading the field that belongs to this screen is what
+                        makes the day they diverge a non-event. */}
+                    <RouteChip summary={bookSummary} style={styles.titleChip} testID="library-route-chip" />
+                </View>
 
                 {canAddBooks ? (
                     <TouchableOpacity
@@ -1323,8 +1371,6 @@ export function DeviceScreen() {
                 ) : books.length === 0 ? (
                     <EmptyLibrary
                         canAddBooks={canAddBooks}
-                        connected={connected}
-                        mailboxConfigured={mailboxConfigured}
                         // Neither side answered, so "No books yet" would be a
                         // claim nothing supports — see EmptyLibrary.
                         listed={readerFresh || mailboxOk}
@@ -1367,16 +1413,14 @@ export function DeviceScreen() {
 
                         {advancedOpen ? (
                             !connected ? (
-                                <Text style={styles.caption}>
-                                    Folders are only browsable while you're on the reader's
-                                    WiFi.
-                                </Text>
+                                <Text style={styles.caption}>{READER_ASLEEP_CAPTION}</Text>
                             ) : (
                                 <>
-                                    <Text style={styles.advancedHint}>
-                                        Everything on the card, folder by folder — including
-                                        the files the library above doesn't cover.
-                                    </Text>
+                                    {/* The hint that sat here ("Everything on the
+                                        card, folder by folder — including the
+                                        files the library above doesn't cover") is
+                                        gone. The disclosure is labelled "All
+                                        files" and what follows is the folders. */}
 
                                     {/* Books Section */}
                                     <View style={styles.section}>
@@ -1576,26 +1620,25 @@ function BookRow({
  * The empty library.
  *
  * A FIRST-CLASS STATE: a fresh pairing lands here, so it gets the brand mark and
- * a way out rather than a bare sentence. The copy changes with what the phone can
- * actually do — offering "Add books" to a phone with no reader and no mailbox
- * would be offering a button that cannot work.
+ * a way out rather than a bare sentence. The ACTION still changes with what the
+ * phone can do — offering "Add books" to a phone with no road at all would be
+ * offering a button that cannot work — but the copy no longer branches on
+ * `connected` or `mailboxConfigured` to explain where an added book would go.
+ * The route chip beside the screen title says that, once, in a word, and those
+ * two props left with the sentences that read them.
  *
- * `listed` IS NOT COSMETIC. An empty list means one of two very different things:
- * both sides answered and there really are no books, or NEITHER side could be
- * read — a sleeping reader with no cached listing and no mailbox. Saying "No books
- * yet" in the second case is a claim about content nothing has looked at, so that
- * case says so instead.
+ * `listed` IS NOT COSMETIC and stays. An empty list means one of two very
+ * different things: both sides answered and there really are no books, or
+ * NEITHER side could be read — a sleeping reader with no cached listing and no
+ * mailbox. Saying "No books yet" in the second case is a claim about content
+ * nothing has looked at, so that case says so instead.
  */
 function EmptyLibrary({
     canAddBooks,
-    connected,
-    mailboxConfigured,
     listed,
     onAddBooks,
 }: {
     canAddBooks: boolean;
-    connected: boolean;
-    mailboxConfigured: boolean;
     /** True when at least one side (reader or mailbox) actually answered. */
     listed: boolean;
     onAddBooks: () => void;
@@ -1603,20 +1646,18 @@ function EmptyLibrary({
     const theme = useTheme();
     const styles = useMemo(() => createStyles(theme), [theme]);
 
-    // Deliberately does NOT diagnose which side failed: the two captions above
-    // this card already do, one per side, and a third opinion here could
-    // contradict them. This says only what it knows — that nothing was read.
-    const message = !listed
-        ? canAddBooks
-            ? "Couldn't read the list — nothing answered. Books already on the card are untouched, and anything you add now goes over on the next connection."
-            : "Couldn't read the list — nothing answered. Join the reader's WiFi, or set up a mailbox in Settings."
-        : canAddBooks
-            ? connected
-                ? "No books yet. Add a few and they'll go straight onto the reader."
-                : "No books yet. Add a few now — they'll wait in the mailbox and land on the reader next time it wakes."
-            : mailboxConfigured
-                ? "No books yet."
-                : "No books yet. Join the reader's WiFi to add some, or set up a mailbox in Settings to send them while it sleeps.";
+    // ONE WARM LINE PER STATE, down from a five-branch matrix of sentences.
+    //
+    // Deliberately does NOT diagnose which side failed, or say where an added
+    // book would travel: the two captions above this card already carry the
+    // per-side status, and the route chip beside the title carries the road. A
+    // third opinion here could contradict either.
+    //
+    // The `listed` distinction SURVIVES the trim, because it is the one thing
+    // this card knows that nothing else on screen does: "no books" and "nobody
+    // answered" are different facts, and printing the first when the second is
+    // true is a claim about content nothing has looked at.
+    const message = listed ? 'No books yet.' : "Couldn't read the list.";
 
     return (
         <View style={styles.placeholderCard}>
@@ -1784,16 +1825,38 @@ function createStyles(theme: Theme) {
         // paddingBottom is supplied at the call site from useTabBarInset() —
         // it depends on the safe-area inset, which a static sheet can't see.
     },
+    /**
+     * Title and route chip on one baseline.
+     *
+     * `space-between` rather than a gap: the chip belongs to the far edge, where
+     * a status reads as status. Next to the serif it reads as a subtitle, which
+     * is the thing being deleted.
+     */
+    titleRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        marginBottom: theme.spacing.lg,
+        gap: theme.spacing.sm,
+    },
+    /** Pairs with `title`'s `flexShrink: 1` — the chip keeps its one word. */
+    titleChip: {
+        flexShrink: 0,
+    },
     title: {
         ...theme.type.h1,
         fontFamily: theme.fonts.display,
         color: theme.colors.text,
-        marginBottom: 6,
-    },
-    subtitle: {
-        ...theme.type.body,
-        color: theme.colors.textMuted,
-        marginBottom: theme.spacing.md,
+        // No marginBottom: `titleRow` owns the gap now that the subtitle under
+        // it is gone.
+        //
+        // THE HEADING YIELDS, NOT THE CHIP. `space-between` on a row with no
+        // wrap gives both children their natural width, and 'Next sync' is wide
+        // enough that a large system font scale on a narrow device would push
+        // the two into each other. Shrinking the serif h1 (which can ellipsize
+        // 'Library' harmlessly) is strictly better than shrinking a chip whose
+        // whole content is one word.
+        flexShrink: 1,
     },
     /** Quiet status lines — an asleep reader gets a sentence, never a banner. */
     caption: {
@@ -1979,11 +2042,7 @@ function createStyles(theme: Theme) {
         ...theme.type.label,
         color: theme.colors.accent,
     },
-    advancedHint: {
-        ...theme.type.caption,
-        color: theme.colors.textMuted,
-        marginBottom: theme.spacing.md,
-    },
+    // `advancedHint` went with the one sentence it styled.
     section: {
         marginBottom: 28,
     },

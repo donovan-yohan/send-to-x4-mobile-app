@@ -18,7 +18,10 @@ import expo.modules.kotlin.modules.ModuleDefinition
  *     MailboxProxyServer.forward sets an explicit, closed header set). §2's write token lives in
  *     the JS layer (`src/services/mailbox_client.ts`) and has no path into this module: no
  *     function here takes a token, so there is nothing to leak onto the peer interface.
- *   - It cannot serve anything but `/cp-proxy` and `/m/…`.
+ *   - It cannot serve anything but `/cp-proxy`, `/cp-wifi` and `/m/…`. The first two are answered
+ *     LOCALLY and can never become a forward; `/cp-wifi` additionally does not exist at all unless
+ *     the caller passed `wifiSharePath`, and it is the only path that accepts a method other than
+ *     GET/HEAD (a DELETE, which is the reader's ack). See [ProxyContract.WIFI_PATH].
  *   - It cannot read a file outside this app's own storage. The local-serve outbox names its bodies
  *     by path, and every one of them is canonicalised and refused unless it sits under `dataDir` or
  *     an external files directory belonging to this app (see [ReaderLinkSession] and [LocalOutbox]).
@@ -71,7 +74,8 @@ class ReaderLinkModule : Module() {
       // the names src/services/reader_link.ts subscribes to by
       // scripts/reader-link-contract.test.js, which is the only thing that can fail on a drift.
       ReaderLinkEvents.PROXY_MODE,
-      ReaderLinkEvents.LOCAL_DELIVERY
+      ReaderLinkEvents.LOCAL_DELIVERY,
+      ReaderLinkEvents.WIFI_SHARE
     )
 
     OnCreate {

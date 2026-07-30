@@ -12,12 +12,14 @@ import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.URL
+import java.net.UnknownHostException
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -121,6 +123,19 @@ private const val NO_UPSTREAM_NOTE = "no internet through this phone, so the mai
  *
  * RANGE MATH IS [ByteRanges] AND IT IS LOAD BEARING. A book crosses several reader windows, each
  * asking for the bytes after what it has; one byte wrong strands the download for ever.
+ *
+ * ------------------------------------------------------------------------------------------
+ * ONE MORE LOCAL ENDPOINT, AND IT IS NOT PART OF THE MAILBOX CONTRACT
+ * ------------------------------------------------------------------------------------------
+ * `/cp-wifi` hands the phone's own WiFi credential to a reader that has no keyboard worth typing a
+ * passphrase on. It is answered by [serveWifi] from a file the JS half staged, it is classified
+ * before the forward prefix so it can never be sent upstream, and it emits NO activity event at
+ * all. See [ProxyContract.WIFI_PATH] for the full set of properties and where each is enforced.
+ *
+ * IT IS ALSO THE ONE ENDPOINT WITH A PEER IDENTITY CHECK. The listener is reachable by every
+ * station on the reader's AP, and for the mailbox endpoints that is tolerable — the worst a
+ * squatter gets is a note the mailbox would have served it anyway. A home WiFi passphrase is not,
+ * so [isPeer] answers 404 to anything that is not the AP's own address. See its KDoc.
  */
 internal class MailboxProxyServer(
   private val bindAddress: Inet4Address,
@@ -129,12 +144,33 @@ internal class MailboxProxyServer(
   private val forwardPrefix: String,
   private val upstreamSupplier: () -> Network?,
   private val peerNetworkSupplier: () -> Network?,
+  /**
+   * The reader's address on the peer link, for the `/cp-wifi` identity check. See [isPeer].
+   */
+  private val peerGatewaySupplier: () -> Inet4Address?,
   private val outbox: LocalOutbox?,
+  /** Null when the session was started without `wifiSharePath`, and then `/cp-wifi` 404s. */
+  private val wifiShare: WifiShareStore?,
   private val onActivity: (Map<String, Any?>) -> Unit,
-  private val onLocalDelivery: (Map<String, Any?>) -> Unit
+  private val onLocalDelivery: (Map<String, Any?>) -> Unit,
+  /**
+   * The WiFi handover signal, as a STATE WORD and nothing else.
+   *
+   * A `(String) -> Unit` rather than the `(Map<String, Any?>) -> Unit` its two neighbours take, and
+   * that is the enforcement rather than the style: there is no shape here in which an SSID, a
+   * passphrase or a path could ride the one event this endpoint produces, even by accident.
+   */
+  private val onWifiShare: (String) -> Unit
 ) {
   private val stopped = AtomicBoolean(false)
   private val active = AtomicInteger(0)
+
+  /**
+   * Whether a `/cp-wifi` GET has actually handed a body over in THIS session. Gates the DELETE —
+   * see [serveWifi] on why an ack that follows no answer is a false receipt rather than a no-op.
+   */
+  private val wifiServed = AtomicBoolean(false)
+
   private val liveSockets: MutableSet<Socket> =
     Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
 
@@ -291,6 +327,17 @@ internal class MailboxProxyServer(
     var localComplete = false
     var upstreamOk: Boolean? = null
     var upstreamError: String? = null
+    /**
+     * TELEMETRY OFF, for the one target that carries a secret.
+     *
+     * A `/cp-wifi` request produces NO activity event, which is also what keeps it out of the
+     * session's request counter, byte counter and `lastStatus` (all three live in
+     * [ReaderLinkSession.onProxyActivity], which is only reached through that emit). Redaction
+     * would not be enough here: the fact that a credential was asked for, and whether it was
+     * there, is itself the thing that must not turn up in a status line or a crash report. The
+     * contentless `onWifiShare` state is the entire replacement.
+     */
+    var suppressActivity = false
 
     try {
       client.tcpNoDelay = true
@@ -318,6 +365,13 @@ internal class MailboxProxyServer(
               ProxyContract.HEALTH_CONTENT_TYPE,
               includeBody
             )
+          }
+
+          TargetKind.WIFI -> {
+            // Set BEFORE the answer is written, so an IOException mid response cannot fall
+            // through to the activity emit with the target still identified.
+            suppressActivity = true
+            serveWifi(request, out, includeBody, client.inetAddress)
           }
 
           TargetKind.FORWARD -> {
@@ -354,39 +408,173 @@ internal class MailboxProxyServer(
       // window that the activity event still reports, which is what the reader's retry expects.
       note = e.message ?: e.javaClass.simpleName
     } finally {
-      onActivity(
-        mapOf(
-          "method" to method,
-          "path" to redacted,
-          "status" to status,
-          "bytes" to bytes,
-          "durationMs" to (SystemClock.elapsedRealtime() - startedAt),
-          "range" to range,
-          // `note` is this module's name for it; `error` is the key
-          // src/services/reader_link.ts reads. Same string, two keys — the two halves have no
-          // shared compile step, and a silently-dropped field is not worth one saved word.
-          "note" to note,
-          "error" to note,
-          // Local-serve telemetry, mirrored onto the activity stream the JS layer ALREADY
-          // subscribes to. `onLocalDelivery` is the precise channel, but the two halves have no
-          // shared compile step, so a delivery must also be visible to a JS build that never
-          // learned the new event name.
-          "source" to source,
-          "mode" to mode,
-          "localId" to localId,
-          "localComplete" to localComplete,
-          // WHETHER THE MAILBOX WAS REACHED, as a fact separate from the answer the reader got.
-          //
-          // It is separate because the two diverge in exactly the case that was invisible: a
-          // contract endpoint whose forward died before a byte was written answers the reader
-          // 200-with-an-empty-body or a local merge, and is indistinguishable on every other
-          // field from a healthy window. `null` means "no upstream was attempted on this request"
-          // (a local note won `latest.txt`), which is NOT the same as "it failed" and must not be
-          // reported as one.
-          "upstreamOk" to upstreamOk,
-          "upstreamError" to upstreamError
+      if (!suppressActivity) {
+        onActivity(
+          mapOf(
+            "method" to method,
+            "path" to redacted,
+            "status" to status,
+            "bytes" to bytes,
+            "durationMs" to (SystemClock.elapsedRealtime() - startedAt),
+            "range" to range,
+            // `note` is this module's name for it; `error` is the key
+            // src/services/reader_link.ts reads. Same string, two keys — the two halves have no
+            // shared compile step, and a silently-dropped field is not worth one saved word.
+            "note" to note,
+            "error" to note,
+            // Local-serve telemetry, mirrored onto the activity stream the JS layer ALREADY
+            // subscribes to. `onLocalDelivery` is the precise channel, but the two halves have no
+            // shared compile step, so a delivery must also be visible to a JS build that never
+            // learned the new event name.
+            "source" to source,
+            "mode" to mode,
+            "localId" to localId,
+            "localComplete" to localComplete,
+            // WHETHER THE MAILBOX WAS REACHED, as a fact separate from the answer the reader got.
+            //
+            // It is separate because the two diverge in exactly the case that was invisible: a
+            // contract endpoint whose forward died before a byte was written answers the reader
+            // 200-with-an-empty-body or a local merge, and is indistinguishable on every other
+            // field from a healthy window. `null` means "no upstream was attempted on this request"
+            // (a local note won `latest.txt`), which is NOT the same as "it failed" and must not be
+            // reported as one.
+            "upstreamOk" to upstreamOk,
+            "upstreamError" to upstreamError
+          )
         )
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------------------------
+  // WiFi handover — the local only credential endpoint
+  // -----------------------------------------------------------------------------------------
+
+  /**
+   * IS THIS CONNECTION THE READER, or merely something else associated to the same AP?
+   *
+   * EVERY OTHER ENDPOINT ON THIS LISTENER CAN AFFORD NOT TO ASK. A station that squats on the
+   * reader's AP and pulls `/m/{boxId}/latest.txt` gets a love note, which is bad but is the same
+   * exposure the mailbox already has; `/cp-wifi` hands out the user's HOME WIFI PASSPHRASE, which
+   * is a capability this endpoint would be granting for the first time. Subnet is no test at all
+   * here: the squatter and the reader are on the same /24 by construction.
+   *
+   * THE READER IS THE AP, SO THE READER IS THE GATEWAY, and that is the one address on the link
+   * another station cannot take without breaking the network it is squatting on.
+   *
+   * THE FALLBACK IS NOT "FAIL OPEN". When the platform exposes no gateway at all — possible on a
+   * local-only `WifiNetworkSpecifier` network whose route table carries the on-link prefix and
+   * nothing else — the AP's address is DERIVED as the `.1` of the address the listener is bound
+   * to. That is not a guess: the firmware never calls `softAPConfig`, so the ESP-IDF defaults
+   * apply (AP 192.168.4.1/24, pool from .2), which `PeerApLink.awaitPeerIpv4` already documents.
+   * A squatter is a DHCP client and lands in the pool, so it still fails this test. Failing closed
+   * instead would silently kill the whole feature on any device that does not publish a gateway,
+   * with the user staring at "Will hand over on the next sync" for ever.
+   */
+  private fun isPeer(remote: InetAddress?): Boolean {
+    val client = remote as? Inet4Address ?: return false
+    val expected = peerGatewaySupplier() ?: assumedGateway() ?: return false
+    return client == expected
+  }
+
+  /** The `.1` of the bound address's /24. See [isPeer] for why this is a fact and not a guess. */
+  private fun assumedGateway(): Inet4Address? {
+    val octets = bindAddress.address
+    if (octets.size != 4) return null
+    val guess = octets.copyOf()
+    guess[3] = 1
+    return try {
+      InetAddress.getByAddress(guess) as? Inet4Address
+    } catch (e: UnknownHostException) {
+      // getByAddress only throws on a wrong-length array, which is checked above.
+      null
+    }
+  }
+
+  /**
+   * Answers `/cp-wifi`. Returns nothing, on purpose: there is no [ForwardResult] here because
+   * there is no activity event, no status to count and no byte total to add up (see
+   * [ProxyContract.WIFI_PATH]).
+   *
+   * FOUR 404s, ONE 200, ONE ACK, and nothing else can happen:
+   *   - the connection is not the reader ([isPeer]) -> 404 for every method,
+   *   - no `wifiSharePath` on this session  -> 404 for every method,
+   *   - nothing staged, or a staged file this process may not read -> 404,
+   *   - a staged credential -> 200 with `{ssid}\n{psk}\n`,
+   *   - DELETE -> the file is removed FIRST and then `ok\n` is written, so the ack cannot be
+   *     acknowledged without the credential already being gone.
+   *
+   * A DELETE BEFORE ANY GET IS ALSO A 404, as a second layer under [isPeer]. An unanswered ack is
+   * not an ack: it consumes the file and tells JS to wipe its staging, which would leave the card
+   * reading "Handed over to the reader" for a credential nothing ever received. The real reader
+   * cannot trip it, because it only ever sends the DELETE after a 200 it parsed.
+   *
+   * The upstream is not consulted on any branch. It cannot be: this method has no [Network] and no
+   * call site that could give it one.
+   */
+  private fun serveWifi(
+    request: ProxyRequest,
+    out: OutputStream,
+    includeBody: Boolean,
+    remote: InetAddress?
+  ) {
+    // FIRST, before the store is even consulted: a 404 here must be indistinguishable from the
+    // "nothing staged" 404, so a station that is not the reader cannot use the response to learn
+    // whether a credential exists, and HEAD cannot leak its length.
+    if (!isPeer(remote)) {
+      HttpWire.writeStatusOnly(out, 404, includeBody)
+      return
+    }
+
+    val store = wifiShare
+    if (store == null) {
+      HttpWire.writeStatusOnly(out, 404, includeBody)
+      return
+    }
+
+    if (request.method == "DELETE") {
+      if (!wifiServed.get()) {
+        HttpWire.writeStatusOnly(out, 404, includeBody)
+        return
+      }
+      // DELETE FIRST. If writing the ack fails the credential is still gone, which is the safe
+      // direction: the reader retries the GET next window and finds nothing, rather than the
+      // phone holding a passphrase the reader has already saved.
+      val had = store.consume()
+      val body = ProxyContract.WIFI_ACK_BODY.toByteArray(Charsets.US_ASCII)
+      HttpWire.writeLocalResponse(
+        out,
+        200,
+        body,
+        ProxyContract.WIFI_CONTENT_TYPE,
+        includeBody,
+        mailboxHeaders()
       )
+      // Only when there was something to remove. A DELETE of nothing is not a handover, and
+      // telling JS to wipe its staging on one would drop a credential the reader never took.
+      if (had) onWifiShare(ProxyContract.WIFI_STATE_DELIVERED)
+      return
+    }
+
+    val staged = store.read()
+    if (staged == null) {
+      HttpWire.writeStatusOnly(out, 404, includeBody)
+      return
+    }
+    val body = staged.body()
+    HttpWire.writeLocalResponse(
+      out,
+      200,
+      body,
+      ProxyContract.WIFI_CONTENT_TYPE,
+      includeBody,
+      mailboxHeaders()
+    )
+    // HEAD carries no body, so nothing was handed over and nothing is claimed — and it does not
+    // arm the DELETE either, for the same reason.
+    if (includeBody) {
+      wifiServed.set(true)
+      onWifiShare(ProxyContract.WIFI_STATE_SERVED)
     }
   }
 

@@ -96,11 +96,14 @@ import {
 import * as Clipboard from 'expo-clipboard';
 import { copyAsync, deleteAsync, documentDirectory } from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
+import { useNavigation } from '@react-navigation/native';
 
 import { ActionButton } from '../components/ActionButton';
 import { CanvasComposer } from '../components/CanvasComposer';
 import { DevicePreview } from '../components/DevicePreview';
+import { RouteChip } from '../components/RouteChip';
 import { SegmentedControl } from '../components/SegmentedControl';
+import { useDeliverability } from '../services/useDeliverability';
 import { useTabBarInset, useTheme, type Theme } from '../theme';
 import { useConnection } from '../contexts/ConnectionProvider';
 import { useProgress } from '../contexts/ProgressProvider';
@@ -122,7 +125,6 @@ import { mintNoteId } from '../services/mailbox_client';
 import {
     LOVE_NOTE_PATH_LABEL,
     MAILBOX_SETUP_HINT,
-    isMailboxConfigured,
     sendLoveNote,
     type LoveNoteDestination,
 } from '../services/love_note_sender';
@@ -284,6 +286,8 @@ export function ComposeScreen({
     onSharedImageConsumed,
 }: ComposeScreenProps) {
     const { settings, connectionStatus } = useConnection();
+    // Only for the route chip's one pressable state ('setup-needed' -> Settings).
+    const navigation = useNavigation<any>();
     // `uploadText` is READ as well as written: it is the phase line under the
     // send button, and the only thing on screen during the stretch where the
     // route has no percent to report. One shared provider, no second copy of the
@@ -455,7 +459,14 @@ export function ComposeScreen({
         [role, settings]
     );
 
-    const mailboxReady = isMailboxConfigured(destination);
+    /**
+     * Which roads are open, from the app's ONE model of that question.
+     *
+     * Replaces this screen's local `isMailboxConfigured(destination)` — same
+     * predicate underneath (the model delegates to it), but it also counts the
+     * saved-AP-passphrase road that a mailbox-only test could not see.
+     */
+    const deliverability = useDeliverability();
 
     /**
      * What the app already knows about whether the reader is answering.
@@ -851,17 +862,15 @@ export function ComposeScreen({
     );
 
     const handleSend = useCallback(async () => {
-        // The ONLY hard precondition is that SOME route exists. A reader that is
+        // The ONLY hard precondition is that SOME road exists. A reader that is
         // not answering is normal (it is asleep with its radio off almost all of
-        // the time) and is what the mailbox is for; a client role has no direct
-        // route at all and is mailbox-only by definition.
-        if (!connectionStatus.connected && !mailboxReady) {
-            Alert.alert(
-                'Nowhere to send it',
-                role === 'client'
-                    ? `Notes from this phone go through the mailbox. ${MAILBOX_SETUP_HINT}.`
-                    : `The reader's asleep and there's no mailbox set up to hold this until it wakes. Join its WiFi, or ${MAILBOX_SETUP_HINT.toLowerCase()}.`
-            );
+        // the time) and is what the other two roads are for.
+        //
+        // ACTION-TRIGGERED, so it survives the copy pass: the user just tapped
+        // Send. It should be unreachable — `canSend` gates on the same field —
+        // and it stays as the guard for the tap that beats a settings change.
+        if (!deliverability.anyRoute) {
+            Alert.alert('Nowhere to send it yet', `${MAILBOX_SETUP_HINT}.`);
             return;
         }
 
@@ -1010,10 +1019,8 @@ export function ComposeScreen({
 
         setSending(false);
     }, [
-        connectionStatus.connected,
-        mailboxReady,
+        deliverability.anyRoute,
         reachability,
-        role,
         destination,
         mode,
         photo,
@@ -1035,13 +1042,19 @@ export function ComposeScreen({
     /**
      * Send is enabled when there is SOMEWHERE for the note to go.
      *
-     * Not `connectionStatus.connected` alone: that is the state the mailbox
-     * exists to cover (the reader is asleep with its radio off almost all of the
-     * time, and a client phone is never on its LAN at all), so requiring it
-     * would disable the button in exactly the case the fallback was written for.
+     * `anyRoute`, not `connected || mailboxReady`. The old pair asked about the
+     * radio and about publishing and stopped there, so it missed the handover
+     * road: a host whose mailbox base is serveable but whose write token is
+     * missing had Send DISABLED, while `sendLoveNote` parks the note in the
+     * outbox and the very next Sync-with-reader hands it over. The button said
+     * "impossible" about something the sender does routinely — the exact class
+     * of false statement this pass exists to remove.
+     *
+     * `anyRoute` is not a synonym for "some setting is filled in": it is only
+     * ever true where `deliverability` can name a road the build can drive. A
+     * saved AP passphrase, notably, is not one — see that module's header.
      */
-    const canSend =
-        hasSource && !sending && !encoding && (connectionStatus.connected || mailboxReady);
+    const canSend = hasSource && !sending && !encoding && deliverability.anyRoute;
 
     /** The compose rect this note is being authored into. */
     const compose = composeDimsFor(orientation);
@@ -1070,10 +1083,6 @@ export function ComposeScreen({
                 showsVerticalScrollIndicator={false}
             >
                 <Text style={styles.title}>Compose</Text>
-                <Text style={styles.subtitle}>
-                    Write something, or pick a photo — it'll show up on their reader
-                    like a note left on the pillow.
-                </Text>
 
                 {/* Mode picker */}
                 <SegmentedControl
@@ -1092,11 +1101,11 @@ export function ComposeScreen({
                     onChange={selectOrientation}
                     disabled={sending}
                 />
-                <Text style={styles.helpText}>
-                    {orientation === 'portrait'
-                        ? `Portrait — held like a book. (${compose.width} × ${compose.height}.)`
-                        : `Landscape — turned sideways, full width. (${compose.width} × ${compose.height}.)`}
-                </Text>
+                {/* The explainer that sat here ("Portrait — held like a book",
+                    plus the pixel dimensions) is gone: the DevicePreview below
+                    literally turns, and the note is composed at whichever aspect
+                    is showing. The picture says it, immediately, in the medium
+                    the user cares about. */}
 
                 {/* Shared text handover */}
                 {pendingSharedText ? (
@@ -1144,11 +1153,11 @@ export function ComposeScreen({
                                     onChange={setFit}
                                     disabled={sending}
                                 />
-                                <Text style={styles.helpText}>
-                                    {fit === 'cover'
-                                        ? 'Cover fills the whole screen, trimming the long edge.'
-                                        : 'Fit keeps the whole photo, with a little white border on the sides.'}
-                                </Text>
+                                {/* No caption. Switching Cover/Fit re-encodes and
+                                    the preview redraws with the crop or the white
+                                    border actually in it — describing that in
+                                    words alongside the picture of it was the
+                                    definition of redundant. */}
                             </>
                         ) : null}
                     </View>
@@ -1193,10 +1202,10 @@ export function ComposeScreen({
                     emptyText={emptyPreviewText}
                     busy={encoding}
                 />
-                <Text style={styles.helpText}>
-                    This is exactly what shows up on their reader — {compose.width} ×{' '}
-                    {compose.height}, black and white.
-                </Text>
+                {/* "This is exactly what shows up on their reader" is deleted.
+                    DevicePreview draws a reader-shaped bezel around the encoder's
+                    own buffer and captions it 'Xteink X3' — the frame IS the
+                    claim, and the claim was never in doubt. */}
 
                 {encodeError ? (
                     <View style={styles.errorBanner}>
@@ -1252,23 +1261,25 @@ export function ComposeScreen({
                     {sending && uploadText ? (
                         <Text style={styles.sendPhase}>{uploadText}</Text>
                     ) : null}
-                </View>
 
-                {/* Says where this note will actually GO, which depends on the
-                    role and on whether the reader is answering right now. */}
-                {role === 'client' ? (
-                    <Text style={styles.helpText}>
-                        {mailboxReady
-                            ? 'Notes from this phone go through the mailbox, and the reader collects them the next time it sleeps.'
-                            : `Notes from this phone go through the mailbox. ${MAILBOX_SETUP_HINT}.`}
-                    </Text>
-                ) : !connectionStatus.connected ? (
-                    <Text style={styles.helpText}>
-                        {mailboxReady
-                            ? "Can't reach the reader right now — this'll wait in the mailbox and show up next time it wakes."
-                            : `Can't reach the reader. Join its WiFi, or ${MAILBOX_SETUP_HINT.toLowerCase()} to send while it's asleep.`}
-                    </Text>
-                ) : null}
+                    {/* WHERE THIS NOTE GOES, as a dot and a word.
+                        This replaces a four-branch paragraph over role ×
+                        mailbox × reachability that said the same thing four
+                        long ways. The chip is the only place on this screen
+                        that mentions delivery at all, and in the one state
+                        that needs an action it IS the pointer at Settings —
+                        pressable there, inert otherwise. */}
+                    <RouteChip
+                        summary={deliverability.summary}
+                        onPress={
+                            deliverability.summary === 'setup-needed'
+                                ? () => navigation.navigate('Settings')
+                                : undefined
+                        }
+                        style={styles.routeChip}
+                        testID="compose-route-chip"
+                    />
+                </View>
             </ScrollView>
         </View>
     );
@@ -1289,11 +1300,9 @@ function createStyles(theme: Theme) {
             ...theme.type.h1,
             fontFamily: theme.fonts.display,
             color: theme.colors.text,
-            marginBottom: 6,
-        },
-        subtitle: {
-            ...theme.type.body,
-            color: theme.colors.textMuted,
+            // Was 6, with the subtitle paragraph carrying the rest of the gap.
+            // The paragraph is gone, so the title owns its own breathing room —
+            // otherwise the mode picker rides up against the serif.
             marginBottom: theme.spacing.xl,
         },
         sectionTitle: {
@@ -1319,12 +1328,10 @@ function createStyles(theme: Theme) {
             marginTop: theme.spacing.lg,
             marginBottom: theme.spacing.sm,
         },
-        helpText: {
-            ...theme.type.caption,
-            color: theme.colors.textMuted,
-            lineHeight: 18,
-            marginTop: theme.spacing.sm,
-        },
+        // `helpText` is GONE, not merely unused: it was the style every deleted
+        // explainer on this screen shared, and leaving it here is an invitation
+        // to write another one. Captions that survive (the send phase line) have
+        // their own named styles.
         sourceRow: {
             flexDirection: 'row',
             alignItems: 'center',
@@ -1453,6 +1460,13 @@ function createStyles(theme: Theme) {
             color: theme.colors.textMuted,
             textAlign: 'center',
             marginTop: theme.spacing.sm,
+        },
+        routeChip: {
+            // Centred under the button and given more air than the phase line:
+            // the phase line is transient and belongs to the button, the chip is
+            // permanent and belongs to the screen.
+            alignSelf: 'center',
+            marginTop: theme.spacing.md,
         },
     });
 }

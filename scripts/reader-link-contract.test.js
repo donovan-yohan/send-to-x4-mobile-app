@@ -39,6 +39,12 @@ import {
     buildProxyOptions,
     describeProxyTarget,
 } from '../src/services/reader_link';
+import {
+    WIFI_PSK_MAX_CHARS,
+    WIFI_PSK_MIN_CHARS,
+    WIFI_SSID_MAX_BYTES,
+    serializeWifiCredential,
+} from '../src/services/wifi_share';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -233,6 +239,170 @@ test('the module JS entry re-declares NO wire constant', () => {
         [],
         `modules/reader-link/index.ts exports constants again (${declarations.join(', ')}). The wire ` +
             'values belong in A3 + ProxyContract.kt + src/services/reader_link.ts, which this file gates.'
+    );
+});
+
+// ---------------------------------------------------------------------------
+// THE WIFI HANDOVER — the one endpoint that serves a secret
+//
+// `/cp-wifi` hands the phone's own WiFi credential to a reader that has no keyboard
+// worth typing a passphrase on. Everything about it is a security property that no
+// compiler can hold: it must never be forwarded, never be fetched upstream, never be
+// logged, and must not exist at all unless the session was explicitly asked to share a
+// network. Each test below pins one of those to the code that enforces it.
+// ---------------------------------------------------------------------------
+
+const KOTLIN_WIFI_STORE = readSource(join(KOTLIN_DIR, 'WifiShareStore.kt'));
+
+test('the WiFi wire values agree across the doc, the Kotlin and the app', () => {
+    assert.equal(kotlinString('WIFI_PATH'), doc('CP_WIFI_PATH'));
+    assert.equal(kotlinString('WIFI_CONTENT_TYPE'), doc('CP_WIFI_CONTENT_TYPE'));
+    assert.equal(kotlinString('WIFI_ACK_BODY'), doc('CP_WIFI_ACK_BODY'));
+    assert.equal(kotlinInt('WIFI_SSID_MAX_BYTES'), Number.parseInt(doc('CP_WIFI_SSID_MAX_BYTES'), 10));
+    assert.equal(kotlinInt('WIFI_PSK_MIN_CHARS'), Number.parseInt(doc('CP_WIFI_PSK_MIN_CHARS'), 10));
+    assert.equal(kotlinInt('WIFI_PSK_MAX_CHARS'), Number.parseInt(doc('CP_WIFI_PSK_MAX_CHARS'), 10));
+    // The reader probes this at the peer ORIGIN ROOT, exactly like /cp-proxy, so it must
+    // carry no capability of its own.
+    assert.equal(kotlinString('WIFI_PATH').includes('/m/'), false);
+    // ...and it must not be the health path, which is answered with a different body.
+    assert.notEqual(kotlinString('WIFI_PATH'), kotlinString('HEALTH_PATH'));
+    // The JS validators apply the SAME bounds the firmware will, so a credential the app
+    // accepts is one the reader can use.
+    assert.equal(WIFI_SSID_MAX_BYTES, kotlinInt('WIFI_SSID_MAX_BYTES'));
+    assert.equal(WIFI_PSK_MIN_CHARS, kotlinInt('WIFI_PSK_MIN_CHARS'));
+    assert.equal(WIFI_PSK_MAX_CHARS, kotlinInt('WIFI_PSK_MAX_CHARS'));
+    // And the app emits exactly the two-line body the doc describes.
+    assert.equal(serializeWifiCredential({ ssid: 'Home', password: 'hunter2hunter2' }), 'Home\nhunter2hunter2\n');
+});
+
+test('/cp-wifi is classified BEFORE the forward prefix, so it can never be forwarded', () => {
+    // THE ORDERING IS THE GUARANTEE. Whatever `allowedPathPrefix` a session was configured
+    // with — `/m/`, or a sub-path deployment's full base — an exact match on this literal
+    // has already been answered locally by the time the prefix is consulted.
+    const classify = /fun classifyTarget\(([\s\S]*?)\n  \}/.exec(kotlin.httpWire);
+    assert.ok(classify, 'HttpWire no longer declares classifyTarget(...)');
+    const body = classify[1];
+    const wifiAt = body.indexOf('ProxyContract.WIFI_PATH');
+    const forwardAt = body.indexOf('startsWith(forwardPrefix)');
+    assert.ok(wifiAt >= 0, 'classifyTarget no longer recognises ProxyContract.WIFI_PATH');
+    assert.ok(forwardAt >= 0, 'classifyTarget no longer tests the forward prefix');
+    assert.ok(
+        wifiAt < forwardAt,
+        'the /cp-wifi test moved AFTER the forward-prefix test. A prefix that matched it would ' +
+            'send the credential upstream.'
+    );
+    // And nothing anywhere ever asks the mailbox for it.
+    for (const [name, source] of Object.entries(kotlin)) {
+        if (name === 'proxyContract' || name === 'httpWire') continue;
+        assert.doesNotMatch(
+            source,
+            /upstreamOrigin\s*\+\s*ProxyContract\.WIFI_PATH/,
+            `${name}.kt builds an upstream URL from the WiFi path`
+        );
+    }
+});
+
+test('DELETE is admitted for the WiFi path ONLY', () => {
+    // A3's rule is GET|HEAD and nothing else, because the reader never publishes. The ack
+    // is the one write in the module and it is pinned to one literal local path; the gate
+    // below is what stops a DELETE reaching anything under the forward prefix.
+    assert.match(kotlin.httpWire, /method != "GET" && method != "HEAD"/);
+    const gate = /if \(method != "GET" && method != "HEAD"\) \{([\s\S]*?)\n    \}/.exec(kotlin.httpWire);
+    assert.ok(gate, 'HttpWire no longer gates the method in a parseable block');
+    assert.match(gate[1], /method == "DELETE"/);
+    assert.match(gate[1], /pathOf\(target\) == ProxyContract\.WIFI_PATH/);
+    assert.match(gate[1], /throw HttpProtocolException\(405/);
+    // The upstream forward still only ever relays the reader's own method, and the reader
+    // can only have got GET or HEAD past the gate above for a forwardable target.
+    assert.match(kotlin.proxyServer, /connection\.requestMethod = request\.method/);
+});
+
+test('a /cp-wifi request produces NO activity event and moves NO counter', () => {
+    // Redaction is not enough here: "a credential was asked for, and it was there" is
+    // itself the fact worth withholding. Suppressing the emit also suppresses the request
+    // counter, the byte counter and lastStatus, because all three live in
+    // ReaderLinkSession.onProxyActivity, which is only reached through it.
+    assert.match(kotlin.proxyServer, /suppressActivity = true/);
+    assert.match(kotlin.proxyServer, /if \(!suppressActivity\) \{/);
+    const handle = /private fun handle\(client: Socket\)([\s\S]*?)\n  \}\n/.exec(kotlin.proxyServer);
+    assert.ok(handle, 'MailboxProxyServer no longer declares handle(client: Socket)');
+    const wifiBranch = handle[1].indexOf('TargetKind.WIFI');
+    const suppress = handle[1].indexOf('suppressActivity = true');
+    assert.ok(wifiBranch >= 0 && suppress > wifiBranch, 'the WIFI branch no longer suppresses telemetry');
+    assert.match(kotlin.session, /requestCount\.incrementAndGet\(\)/);
+    assert.match(kotlin.session, /private fun onProxyActivity/);
+});
+
+test('the WiFi event can carry a state word and nothing else', () => {
+    // The emit MailboxProxyServer is given takes a single String, so there is no shape in
+    // which an SSID or a passphrase could ride the one event this endpoint produces. The
+    // map is built in the session, from that word, in one place.
+    assert.match(kotlin.proxyServer, /onWifiShare: \(String\) -> Unit/);
+    assert.match(kotlin.session, /emit\(ReaderLinkEvents\.WIFI_SHARE, mapOf\("state" to state\)\)/);
+    // Declared by the module, or the emit is swallowed and the feature reports nothing.
+    const wifiEvent = readerLinkEventConstants().get('WIFI_SHARE');
+    assert.ok(wifiEvent, 'ReaderLinkEvents no longer declares WIFI_SHARE');
+    assert.ok(declaredEventNames().includes(wifiEvent));
+    assert.ok(subscribedEventNames().includes(wifiEvent));
+    // And the JS half reads only `state` off it.
+    assert.ok(tsReadsField('state'));
+});
+
+test('the endpoint does not exist without the opt-in, and confines its file', () => {
+    // OPT IN: no wifiSharePath, no store, and serveWifi 404s every method. A session that
+    // was never asked to share a network cannot be talked into it by anything that
+    // associates with the reader's AP.
+    assert.match(kotlin.options, /var wifiSharePath: String\? = null/);
+    assert.match(kotlin.session, /validated\.wifiSharePath\?\.let \{ WifiShareStore\(it, outboxRoots\) \}/);
+    const serve = /private fun serveWifi\(([\s\S]*?)\n  \}\n/.exec(kotlin.proxyServer);
+    assert.ok(serve, 'MailboxProxyServer no longer declares serveWifi(...)');
+    assert.match(serve[1], /val store = wifiShare\s*\n\s*if \(store == null\) \{/);
+    // SINGLE SERVE: the file is deleted BEFORE the ack is written, so a second GET in the
+    // same session answers 404 whether or not JS ever hears the event.
+    const consumeAt = serve[1].indexOf('store.consume()');
+    const ackAt = serve[1].indexOf('WIFI_ACK_BODY');
+    assert.ok(consumeAt >= 0 && ackAt > consumeAt, 'the ack is written before the credential is removed');
+    // CONFINEMENT: the staged file is canonicalised and refused unless it sits inside this
+    // app's own storage, exactly as an outbox body is.
+    assert.match(KOTLIN_WIFI_STORE, /canonicalFile/);
+    assert.match(KOTLIN_WIFI_STORE, /canonical\.path\.startsWith\(canonicalRoot\.path \+ File\.separator\)/);
+    // Stricter than the outbox on purpose: this filename is fixed ASCII, so an escape can
+    // only mean the path is not the one the module expects.
+    assert.match(KOTLIN_WIFI_STORE, /indexOf\('%'\) >= 0\) return null/);
+    // And the file is capped, so this never reads something it was not handed.
+    assert.match(KOTLIN_WIFI_STORE, /ProxyContract\.WIFI_FILE_MAX_BYTES/);
+});
+
+test('/cp-wifi answers the READER and not every station on its AP', () => {
+    // The listener is reachable by anything associated to the reader's soft AP. For the mailbox
+    // endpoints that is the exposure the mailbox already has; for a HOME WIFI PASSPHRASE it is a
+    // new capability, and a subnet test cannot help because the squatter shares the /24 by
+    // construction. The reader is the AP, so the reader is the gateway.
+    const serve = /private fun serveWifi\(([\s\S]*?)\n  \}\n/.exec(kotlin.proxyServer);
+    assert.ok(serve, 'MailboxProxyServer no longer declares serveWifi(...)');
+    // THE GATE IS FIRST — before the store is consulted, so a refusal is byte-identical to the
+    // "nothing staged" 404 and cannot be used to detect that a credential exists. That also
+    // closes HEAD, which would otherwise report the credential's exact length.
+    const peerAt = serve[1].indexOf('if (!isPeer(remote))');
+    const storeAt = serve[1].indexOf('val store = wifiShare');
+    assert.ok(peerAt >= 0, 'serveWifi no longer checks the peer identity');
+    assert.ok(storeAt > peerAt, 'the peer check no longer runs before the store is consulted');
+    // It is the connection's own remote address, taken from the socket rather than from anything
+    // the request could claim.
+    assert.match(kotlin.proxyServer, /serveWifi\(request, out, includeBody, client\.inetAddress\)/);
+    assert.match(kotlin.proxyServer, /private fun isPeer\(remote: InetAddress\?\): Boolean/);
+    assert.match(kotlin.proxyServer, /peerGatewaySupplier\(\)/);
+    assert.match(kotlin.session, /peerGatewaySupplier = \{ peer\.network\?\.let \{ peer\.gatewayIpv4\(it\) \} \}/);
+    assert.match(kotlin.peerLink, /fun gatewayIpv4\(network: Network\): Inet4Address\?/);
+
+    // SECOND LAYER: an ack that follows no answer is a FALSE RECEIPT — it consumes the file and
+    // makes the app's card read "Handed over to the reader" for a credential nothing received.
+    const deleteAt = serve[1].indexOf('request.method == "DELETE"');
+    const armedAt = serve[1].indexOf('wifiServed.get()');
+    assert.ok(deleteAt >= 0 && armedAt > deleteAt, 'DELETE no longer requires a served GET first');
+    assert.ok(
+        serve[1].indexOf('wifiServed.set(true)') > serve[1].indexOf('val staged = store.read()'),
+        'the arming no longer happens on the GET that actually handed a body over'
     );
 });
 

@@ -1121,6 +1121,12 @@ CP_PROXY_HEALTH_BODY_BYTES = 11
 CP_PROXY_HEALTH_CONTENT_TYPE = text/plain; charset=utf-8
 CP_PROXY_PORT = 8080
 CP_PROXY_FORWARD_PREFIX = /m/
+CP_WIFI_PATH = /cp-wifi
+CP_WIFI_CONTENT_TYPE = text/plain; charset=utf-8
+CP_WIFI_ACK_BODY = "ok\n"
+CP_WIFI_SSID_MAX_BYTES = 32
+CP_WIFI_PSK_MIN_CHARS = 8
+CP_WIFI_PSK_MAX_CHARS = 63
 ```
 
 Notes that are part of the contract and not decoration:
@@ -1134,6 +1140,64 @@ Notes that are part of the contract and not decoration:
   forwarded upstream — so it works before any mailbox round-trip and cannot leak the `boxId`.
 - The **forward prefix** is the only path family the proxy serves; a mailbox mounted under a
   sub-path makes the app pass its full base path instead, which is strictly tighter.
+
+##### `CP_WIFI_PATH` — the WiFi handover, and the one path that is not a mailbox path
+
+The reader has no keyboard worth typing a WPA2 passphrase on, so the phone hands its own network
+across the peer link. The user types the network **once, on the phone**; nothing is ever typed on
+e-ink. Android will not reveal a saved passphrase (or, without location permission, even the current
+SSID) to any app, so there is no prefill on either field and the app deliberately asks for no new
+permission to chase one.
+
+```text
+GET /cp-wifi
+  200 text/plain; charset=utf-8
+  Cache-Control: no-store, no-cache, must-revalidate
+  Connection: close
+
+  {ssid}\n{psk}\n
+
+  404 when nothing is staged, or when the session was started without the credential.
+
+DELETE /cp-wifi                      <- THE ACK
+  200 text/plain; charset=utf-8
+  Connection: close
+
+  ok\n
+```
+
+Rules the firmware may rely on, each enforced in the app's Kotlin rather than promised here:
+
+- **Two lines, LF, UTF-8.** Line 1 is the SSID (1..`CP_WIFI_SSID_MAX_BYTES` **bytes**), line 2 is the
+  passphrase (empty = an **open** network, otherwise `CP_WIFI_PSK_MIN_CHARS`..`CP_WIFI_PSK_MAX_CHARS`
+  characters). Neither can contain a control character — both sides refuse one rather than strip it,
+  because a newline inside a field would reshape the record. Trim a trailing `\r` defensively; the
+  app never emits one. Anything after line 2 is ignored.
+- **Peer ORIGIN ROOT, not under `/m/{boxId}`.** The reader composes `http://{peerIp}:8080/cp-wifi`,
+  exactly as it does for `/cp-proxy`, and this path likewise carries no capability.
+- **Local only.** The proxy classifies `/cp-wifi` *before* it considers the forward prefix, so no
+  mailbox deployment shape can cause it to be forwarded; nothing fetches it upstream, and no upstream
+  answer can produce it.
+- **Never logged.** The request emits no activity event and moves no request/byte counter on the app
+  side. The only signal is a contentless `onWifiShare` state (`served` after the GET, `delivered`
+  after the ack), which is what makes the phone wipe its own copy.
+- **Single serve.** The `DELETE` removes the staged file *before* writing `ok\n`, so a second `GET`
+  in the same session answers 404. The reader should therefore: `GET` once per session, save the
+  credential, and only then `DELETE`. A reader that saves and never acks gets the same credential
+  offered again next session, which is harmless; a reader that acks without saving loses it.
+- **Opt-in.** With nothing staged on the phone the endpoint does not exist and every method answers
+  404. A 404 here is a normal window, never an error worth reporting.
+- **The reader only.** Unlike every other path on this listener, `/cp-wifi` checks WHO is asking: the
+  connection's remote address must be the peer link's gateway, which on the reader's own soft AP is
+  the reader. Any other station associated to the same AP gets a 404 indistinguishable from "nothing
+  staged", for every method including `HEAD`. This costs the firmware nothing — it is the AP — and it
+  is what stops a squatting station from reading the user's home passphrase off a cleartext local
+  link, or from consuming the credential with a `DELETE` the reader never sent. A `DELETE` that
+  follows no served `GET` in the same session is likewise a 404.
+- **A 404 is not worth retrying forever.** The reader gives up on the pickup after
+  `WIFI_PICKUP_MAX_MISSES` (3) consecutive unanswered attempts on a link and re-arms only on peer
+  rediscovery. Nothing on the phone side depends on the cadence: the credential is staged before the
+  session starts, so the first attempt finds it.
 
 Session caps are deliberately NOT in this block: they are a phone-side policy the reader never sees.
 The app passes ONE cap to native (`PROXY_SESSION_MAX_MS`, 15 min) so its own deadline and the

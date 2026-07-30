@@ -56,6 +56,18 @@
  * delivered or flips a History row to "Delivered directly".
  *
  * ---------------------------------------------------------------------------
+ * ONE MORE THING RIDES THIS LINK, AND IT IS NOT MAILBOX TRAFFIC
+ * ---------------------------------------------------------------------------
+ * The reader also needs a home network, and typing a WPA2 passphrase on e-ink is
+ * the worst interaction in the product. So a credential staged in
+ * `services/wifi_share` is handed down the same peer link on its own local-only
+ * path. This session's whole part in that is three lines: pass the staged file's
+ * PATH to `startProxy` (absent = the endpoint does not exist), record the
+ * reader's ack, and wipe the staging on it. The credential itself never enters
+ * this module — see `ReaderLinkWifiEvent`, which carries a state word and
+ * nothing else.
+ *
+ * ---------------------------------------------------------------------------
  * SERVE MODE — WHERE THE BYTES ARE ACTUALLY COMING FROM
  * ---------------------------------------------------------------------------
  * The proxy started life as a pure forwarder, which meant the phone needed
@@ -79,6 +91,11 @@ import {
 } from './reader_link';
 import { markDelivered, prepareOutboxHandover, supersedeQueuedNotes } from './outbox';
 import { markNoteDeliveredDirectly, markNoteSuperseded } from './message_history';
+import {
+    discardWifiShareHandover,
+    markWifiShareDelivered,
+    prepareWifiShareHandover,
+} from './wifi_share';
 
 // ---------------------------------------------------------------------------
 // Shape
@@ -183,6 +200,23 @@ export interface SyncSession {
      * outbox prune and the History row's "Delivered directly".
      */
     delivered: string[];
+    /**
+     * The staged WiFi credential was offered to the reader on this session.
+     *
+     * `served` only: the reader has the bytes. It is NOT a handover — see
+     * {@link wifiHandedOver} — and nothing is deleted on it.
+     */
+    wifiOffered: boolean;
+    /**
+     * The reader ACKED the WiFi credential, so the passphrase has left this
+     * phone.
+     *
+     * The only thing in this object that causes a secret to be deleted, and the
+     * reason it is a separate field from {@link wifiOffered}: `served` says the
+     * bytes went out of a socket, `delivered` says the reader asked us to stop
+     * holding them. Only the second one is a receipt.
+     */
+    wifiHandedOver: boolean;
 }
 
 export type SyncSessionAction =
@@ -200,6 +234,11 @@ export type SyncSessionAction =
      * twice and add the body's bytes to the session total a second time.
      */
     | { type: 'delivery'; at: number; event: Extract<ReaderLinkEvent, { kind: 'delivery' }> }
+    /**
+     * The WiFi credential was served, or acked. Carries no credential — the
+     * native event has no field that could (see `ReaderLinkWifiEvent`).
+     */
+    | { type: 'wifi'; at: number; event: Extract<ReaderLinkEvent, { kind: 'wifi' }> }
     /**
      * What this session handed the native side from the outbox. NOT a mode: the
      * phone offering three items says nothing about whether upstream is also
@@ -304,6 +343,8 @@ export function initialSyncSession(): SyncSession {
         localServed: 0,
         localSkipped: 0,
         delivered: [],
+        wifiOffered: false,
+        wifiHandedOver: false,
     };
 }
 
@@ -562,6 +603,27 @@ export function reduceSyncSession(session: SyncSession, action: SyncSessionActio
                 delivered: [...session.delivered, itemId],
                 lastProgressAt: action.at,
             };
+        }
+
+        case 'wifi': {
+            // Counted as PROGRESS, because it is: the reader asking for the
+            // credential is the reader talking to this phone, and a handover on a
+            // session that is otherwise quiet must not have the quiet deadline
+            // fire underneath it.
+            if (session.state !== 'proxying') return session;
+            const { state } = action.event;
+            if (state === 'delivered') {
+                return {
+                    ...session,
+                    wifiOffered: true,
+                    wifiHandedOver: true,
+                    lastProgressAt: action.at,
+                };
+            }
+            // `served` is NOT a handover. The reader has the bytes and has said
+            // nothing about saving them, and the phone holds the only copy of a
+            // passphrase the user typed, so nothing is deleted on this branch.
+            return { ...session, wifiOffered: true, lastProgressAt: action.at };
         }
 
         case 'mode': {
@@ -914,6 +976,32 @@ export interface SyncHistoryPort {
     markDeliveredDirectly(noteId: string): Promise<boolean>;
 }
 
+/**
+ * The WiFi credential staging, as this session uses it.
+ *
+ * A PORT for the same reason the outbox is one — `services/wifi_share` touches
+ * AsyncStorage and expo-file-system — and a separate port rather than a field on
+ * {@link SyncOutboxPort} because the two stores have deliberately nothing to do
+ * with each other: one holds bodies the reader enumerates through the mailbox
+ * contract, the other holds a passphrase that must never appear in a manifest.
+ */
+export interface SyncWifiSharePort {
+    /**
+     * Write the native-readable credential and report whether there is one. MUST
+     * NOT THROW: a credential that cannot be staged is a sync without the WiFi
+     * handover, never a failed sync.
+     */
+    prepare(): Promise<{ path: string; pending: boolean }>;
+    /** THE WIPE. Called once, on the reader's ack, and never on `served`. */
+    markDelivered(): Promise<void>;
+    /**
+     * DROP THE EXPORTED COPY, keeping the staging. Called on EVERY session exit,
+     * acked or not, so the plaintext file `prepare()` wrote does not outlive the
+     * session that asked for it. MUST NOT THROW.
+     */
+    discard(): Promise<void>;
+}
+
 const defaultOutboxPort: SyncOutboxPort = {
     async prepare() {
         // COLLAPSE THE NOTE QUEUE FIRST — the reader has exactly one note slot.
@@ -949,6 +1037,17 @@ const defaultHistoryPort: SyncHistoryPort = {
     markDeliveredDirectly: markNoteDeliveredDirectly,
 };
 
+const defaultWifiSharePort: SyncWifiSharePort = {
+    async prepare() {
+        const { path, pending } = await prepareWifiShareHandover();
+        return { path, pending };
+    },
+    async markDelivered() {
+        await markWifiShareDelivered();
+    },
+    discard: discardWifiShareHandover,
+};
+
 export interface SyncSessionDeps {
     /** Injected in tests; the app uses the real {@link readerLink}. */
     link?: ReaderLinkApi;
@@ -958,6 +1057,8 @@ export interface SyncSessionDeps {
     outbox?: SyncOutboxPort;
     /** Injected in tests; the app uses `services/message_history`. */
     history?: SyncHistoryPort;
+    /** Injected in tests; the app uses `services/wifi_share`. */
+    wifiShare?: SyncWifiSharePort;
 }
 
 export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionController {
@@ -966,6 +1067,7 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
     const timeouts: SyncSessionTimeouts = { ...DEFAULT_SYNC_TIMEOUTS, ...deps.timeouts };
     const outbox = deps.outbox ?? defaultOutboxPort;
     const history = deps.history ?? defaultHistoryPort;
+    const wifiShare = deps.wifiShare ?? defaultWifiSharePort;
 
     let session = initialSyncSession();
     const listeners = new Set<(session: SyncSession) => void>();
@@ -1040,6 +1142,16 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
      *
      * The native side also flips the cancel flag in `stopProxy` now, so no
      * caller ordering can reproduce it; this shape is the JS half of that fix.
+     *
+     * THE STAGED WIFI FILE GOES HERE TOO, and for the same "no exit path may
+     * forget it" reason the two native calls are here. `wifiShare.prepare()`
+     * writes the passphrase to a plain file in the app sandbox so the native
+     * side can read it; before this, ONLY the reader's ack removed it, so every
+     * session that ended without one — reader out of range, user taps Stop, the
+     * watchdog fires — left cleartext on disk until the next stage or the next
+     * successful handover. This is the single place every one of those exits
+     * passes through. It removes the FILE only: the staging stays `pending` so
+     * the next session re-offers the network the user asked for.
      */
     const releaseNative = (): Promise<void> => {
         // A native call that throws SYNCHRONOUSLY (a missing method, a fake in a
@@ -1054,11 +1166,15 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
         };
         const stopping = kick(() => link.stopProxy());
         const leaving = kick(() => link.leave());
+        // Not ordered against the two above: it touches the app's own sandbox,
+        // not the radio, and `kick` covers a port (a test fake, an older build)
+        // that has no `discard` at all.
+        const discarding = kick(() => wifiShare.discard());
         // `allSettled`, not `all`: "already closed", "the module is gone" and "the
         // request was never registered" are all non-events here. The session is
         // over either way, and a socket the OS will reclaim is not the user's
         // problem.
-        const run = Promise.allSettled([stopping, leaving]).then(() => undefined);
+        const run = Promise.allSettled([stopping, leaving, discarding]).then(() => undefined);
         releasing = run;
         return run;
     };
@@ -1121,6 +1237,26 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
         }
     };
 
+    /**
+     * Wipe the staged WiFi credential, once the READER HAS ASKED US TO.
+     *
+     * Fire-and-forget and after the reducer, exactly like {@link confirmDelivery}:
+     * this must not hold up the event path of a live link. Swallows its own
+     * failure — a credential that survives its own handover is one redundant
+     * re-offer next session, which is strictly better than an exception on the
+     * event path tearing the link down.
+     *
+     * Guarded by the reducer's `wifiHandedOver` transition rather than by the raw
+     * event, so a `served` (or a second `delivered`) can never reach it.
+     */
+    const confirmWifiHandover = async (): Promise<void> => {
+        try {
+            await wifiShare.markDelivered();
+        } catch (error) {
+            console.warn('[SyncSession] Could not clear the staged WiFi credential:', error);
+        }
+    };
+
     const attach = () => {
         detach();
         unsubscribeLink = link.subscribe(event => {
@@ -1134,13 +1270,21 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
             // precise `onLocalDelivery`, and the id set carried on the `stopped`
             // event that closes the session.
             const before = session.delivered.length;
+            // Same discipline for the WiFi credential: the REDUCER decides that a
+            // handover happened (only an explicit `delivered`, only while
+            // proxying, only once), and this diffs its output. Re-deriving the
+            // rule here is how the two would drift into wiping a passphrase the
+            // reader never acked.
+            const wifiBefore = session.wifiHandedOver;
             if (event.kind === 'link') dispatch({ type: 'link', at, event });
             else if (event.kind === 'proxy') dispatch({ type: 'proxy', at, event });
             else if (event.kind === 'mode') dispatch({ type: 'mode', at, event });
             else if (event.kind === 'delivery') dispatch({ type: 'delivery', at, event });
+            else if (event.kind === 'wifi') dispatch({ type: 'wifi', at, event });
             else dispatch({ type: 'activity', at, event });
             const fresh = session.delivered.slice(before);
             if (fresh.length > 0) void confirmDelivery(fresh);
+            if (!wifiBefore && session.wifiHandedOver) void confirmWifiHandover();
         });
     };
 
@@ -1181,11 +1325,30 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
             }
             if (mine !== epoch) return;
 
+            // ARM THE WIFI CREDENTIAL, on the same terms and with the same
+            // degradation. Nothing staged (or no filesystem) leaves the path
+            // empty, `buildProxyOptions` omits the key, and the native `/cp-wifi`
+            // endpoint does not exist for this session — which is the correct
+            // shape for a user who has never asked to share a network, not an
+            // error to show. It is deliberately NOT dispatched anywhere: the
+            // session says nothing about a credential until the reader has
+            // actually asked for it.
+            let wifiSharePath = '';
+            try {
+                const staged = await wifiShare.prepare();
+                if (mine !== epoch) return;
+                if (staged.pending) wifiSharePath = staged.path;
+            } catch (error) {
+                console.warn('[SyncSession] Could not arm the WiFi handover:', error);
+            }
+            if (mine !== epoch) return;
+
             const built = buildProxyOptions(
                 options.mailboxUrl,
                 options.port ?? PROXY_DEFAULT_PORT,
                 timeouts.sessionMs,
-                manifestPath
+                manifestPath,
+                wifiSharePath
             );
             if (!built.ok) {
                 // Unreachable: `start` validated the same string before joining.

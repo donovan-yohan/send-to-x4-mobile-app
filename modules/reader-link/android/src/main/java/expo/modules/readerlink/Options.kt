@@ -98,6 +98,23 @@ class ProxyOptions : Record {
    */
   @Field
   var outboxManifestPath: String? = null
+
+  /**
+   * Absolute path (or `file://` URI) of the two line WiFi credential the phone is handing to the
+   * reader — `prepareWifiShareHandover()` in src/services/wifi_share.ts. Omit it and the
+   * `/cp-wifi` endpoint does not exist for this session: every method on it answers 404.
+   *
+   * OPT IN, AND THE OPT IN IS THE POINT. This endpoint is the only one in the module that serves a
+   * secret, so a session that was not explicitly asked to share a network must not be talkable
+   * into it by anything that associates with the reader's AP.
+   *
+   * A PATH, NEVER THE VALUES, for the same reason [outboxManifestPath] is: a passphrase in a
+   * Record is a passphrase that any validation message, any options dump and any bug report can
+   * echo. The file is read by [WifiShareStore], which confines it to this app's own storage and
+   * deletes it on the reader's ack.
+   */
+  @Field
+  var wifiSharePath: String? = null
 }
 
 internal class InvalidArgumentException(message: String) : CodedException(message)
@@ -124,7 +141,9 @@ internal data class ValidatedProxy(
   val port: Int,
   val sessionMaxMs: Int,
   val requireCellularUpstream: Boolean,
-  val outboxManifestPath: String?
+  val outboxManifestPath: String?,
+  /** Null = this session does not answer `/cp-wifi` at all. See [ProxyOptions.wifiSharePath]. */
+  val wifiSharePath: String?
 )
 
 internal fun JoinOptions.validated(): ValidatedJoin {
@@ -262,5 +281,30 @@ internal fun ProxyOptions.validated(): ValidatedProxy {
     }
   }
 
-  return ValidatedProxy(origin, prefix, port, session, requireCellularUpstream, manifest)
+  // Same shape check, same reasoning, and one addition: this value is REFUSED if it is not
+  // distinguishable from the manifest, because two endpoints reading one file would let a
+  // `books.txt` line be served as a WiFi credential (or the reverse) with nothing to notice. The
+  // message names the path and nothing else — there is no secret in it, and the secret the file
+  // holds is never read here.
+  val wifi = wifiSharePath?.trim()?.takeIf { it.isNotEmpty() }
+  if (wifi != null) {
+    if (wifi.length > 1024) {
+      throw InvalidArgumentException("wifiSharePath is too long (${wifi.length} characters)")
+    }
+    if (!wifi.startsWith("/") && !wifi.startsWith("file:///")) {
+      throw InvalidArgumentException(
+        "wifiSharePath must be an absolute path or a file:/// URI (got \"$wifi\")"
+      )
+    }
+    for (c in wifi) {
+      if (c.code < 0x20 || c.code == 0x7F) {
+        throw InvalidArgumentException("wifiSharePath contains a control character")
+      }
+    }
+    if (manifest != null && wifi == manifest) {
+      throw InvalidArgumentException("wifiSharePath and outboxManifestPath must name different files")
+    }
+  }
+
+  return ValidatedProxy(origin, prefix, port, session, requireCellularUpstream, manifest, wifi)
 }

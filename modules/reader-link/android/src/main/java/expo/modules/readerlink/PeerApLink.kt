@@ -247,6 +247,41 @@ internal class PeerApLink(
     }
   }
 
+  /**
+   * THE READER'S OWN ADDRESS ON THE PEER LINK — the AP is the gateway.
+   *
+   * Used as an IDENTITY CHECK, not for routing: `/cp-wifi` hands out the user's home WiFi
+   * passphrase and must answer the reader and nothing else, and every OTHER station associated to
+   * the same soft AP is on the same subnet, so a subnet test would allow exactly the attacker it
+   * needs to exclude. The one address a squatting station cannot occupy is the AP's own.
+   *
+   * Two sources, in order:
+   *   - the first IPv4 gateway in the link's route table, which is what DHCP installed, and
+   *   - `dhcpServerAddress` (API 30+), because a LOCAL-ONLY network provisioned by
+   *     `WifiNetworkSpecifier` has `NET_CAPABILITY_INTERNET` removed and its route table may
+   *     therefore carry the on-link /24 with NO default route and no gateway on it at all.
+   *
+   * Null when neither is readable; the caller decides what that means (see `MailboxProxyServer`,
+   * which falls back to the AP's documented address rather than either failing open or killing
+   * the feature).
+   */
+  fun gatewayIpv4(network: Network): Inet4Address? = firstGatewayIpv4(cm.getLinkProperties(network))
+
+  private fun firstGatewayIpv4(linkProperties: LinkProperties?): Inet4Address? {
+    val lp = linkProperties ?: return null
+    for (route in lp.routes) {
+      val gateway = route.gateway
+      if (gateway is Inet4Address && !gateway.isAnyLocalAddress && !gateway.isLoopbackAddress) {
+        return gateway
+      }
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+      val dhcp = lp.dhcpServerAddress
+      if (dhcp != null && !dhcp.isAnyLocalAddress && !dhcp.isLoopbackAddress) return dhcp
+    }
+    return null
+  }
+
   private fun firstIpv4(linkProperties: LinkProperties?): Inet4Address? {
     val lp = linkProperties ?: return null
     for (linkAddress in lp.linkAddresses) {

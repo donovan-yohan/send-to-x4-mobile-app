@@ -235,6 +235,59 @@ object ProxyContract {
   const val SOURCE_LOCAL = "local"
   const val SOURCE_UPSTREAM = "upstream"
   const val SOURCE_MERGED = "merged"
+
+  // -----------------------------------------------------------------------------------------
+  // WIFI HANDOVER — the second local only answer, and the one that carries a secret
+  //
+  // The reader has no keyboard worth typing a WPA2 passphrase on, so the phone hands its network
+  // over the peer link instead. This is a HALF OF A WIRE CONTRACT with the firmware exactly like
+  // the health answer above: the values live in A3's canonical block and
+  // scripts/reader-link-contract.test.js fails when this file and that block disagree.
+  //
+  //   GET {WIFI_PATH}
+  //     200 text/plain; charset=utf-8, body `{ssid}\n{psk}\n` (an EMPTY second line means an open
+  //     network), or 404 when nothing is staged or the session was started without
+  //     ProxyOptions.wifiSharePath.
+  //   DELETE {WIFI_PATH}
+  //     200 text/plain; charset=utf-8, body `ok\n`. THE ACK, and what makes this endpoint SINGLE
+  //     SERVE: the staged file is deleted before the response is written, so a second GET in the
+  //     same session answers 404 and a phone that never hears from JS again still stops offering
+  //     the passphrase.
+  //
+  // FOUR PROPERTIES THIS PATH HAS AND THE FORWARD PATH DOES NOT, each enforced in code rather
+  // than promised here:
+  //   1. NEVER FORWARDED. HttpWire.classifyTarget answers WIFI before it considers the forward
+  //      prefix, so no allowedPathPrefix a session could be configured with can send it upstream.
+  //   2. NEVER ACCEPTED FROM UPSTREAM. No code path fetches this path from the mailbox, and the
+  //      forward header set is closed, so an upstream answer can never become this one.
+  //   3. NEVER LOGGED. MailboxProxyServer suppresses the activity event for this target entirely:
+  //      no path, no status, no byte count, no request counter. The only signal is the contentless
+  //      ReaderLinkEvents.WIFI_SHARE state below.
+  //   4. OPT IN. Absent ProxyOptions.wifiSharePath the endpoint 404s for every method, so a
+  //      session that was never asked to share a network cannot be talked into it.
+  // -----------------------------------------------------------------------------------------
+
+  const val WIFI_PATH = "/cp-wifi"
+  const val WIFI_CONTENT_TYPE = "text/plain; charset=utf-8"
+  const val WIFI_ACK_BODY = "ok\n"
+
+  /** 802.11 caps the SSID at 32 BYTES. The JS validator applies the same bound. */
+  const val WIFI_SSID_MAX_BYTES = 32
+  const val WIFI_PSK_MIN_CHARS = 8
+  const val WIFI_PSK_MAX_CHARS = 63
+
+  /**
+   * Cap on the staged file. Two lines at the bounds above is under 100 bytes, so a file past this
+   * is a wrong path or a bug rather than a credential, and reading it would be reading something
+   * this module was never handed.
+   */
+  const val WIFI_FILE_MAX_BYTES = 1024
+
+  /** Emitted after a GET that put the credential on the wire. Advisory. */
+  const val WIFI_STATE_SERVED = "served"
+
+  /** Emitted after the DELETE ack. THE SIGNAL JS WIPES ITS OWN STAGING ON. */
+  const val WIFI_STATE_DELIVERED = "delivered"
 }
 
 /** Event names. Must match `Events(...)` in [ReaderLinkModule] and the map in index.ts. */
@@ -264,4 +317,20 @@ object ReaderLinkEvents {
    * anywhere in section 1). JS marks the item delivered on it and prunes.
    */
   const val LOCAL_DELIVERY = "onLocalDelivery"
+
+  /**
+   * The WiFi handover, as a STATE WORD AND NOTHING ELSE.
+   *
+   * The payload is `{ "state": "served" | "delivered" }`. It carries no SSID, no passphrase and no
+   * path, and it is the only trace a `/cp-wifi` request leaves anywhere in this module: the
+   * activity event, the request counter and the byte counter are all suppressed for that target
+   * (see [ProxyContract.WIFI_PATH]). The emit signature MailboxProxyServer is given takes a single
+   * String for exactly that reason, so there is no shape in which a credential could ride it even
+   * by accident.
+   *
+   * `delivered` is what the JS half wipes its own staging on. `served` is advisory: the reader has
+   * the bytes but has not confirmed it saved them, which is the one distinction that decides
+   * whether the passphrase may leave the phone.
+   */
+  const val WIFI_SHARE = "onWifiShare"
 }

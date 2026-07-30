@@ -98,16 +98,20 @@ import { ActionButton } from '../components/ActionButton';
 import { DevicePreview } from '../components/DevicePreview';
 import { SegmentedControl } from '../components/SegmentedControl';
 import { BinIcon, WallpaperIcon } from '../components/icons';
+import { InfoTip } from '../components/InfoTip';
+import { READER_ASLEEP_CAPTION, useDirectConnectionRequired } from '../components/ConnectionBanner';
 import { useTabBarInset, useTheme, type Theme } from '../theme';
 import { useConnection } from '../contexts/ConnectionProvider';
 import { useProgress } from '../contexts/ProgressProvider';
-import { COMPOSE_H, COMPOSE_W } from '../device/x3';
+// COMPOSE_H and PANEL_GRAY_LEVELS left with the preview explainers that quoted
+// them ("W × H sleep screen", "only N shades of gray"). COMPOSE_W stays — it
+// sizes the source preview render, which is geometry, not copy.
+import { COMPOSE_W } from '../device/x3';
 import {
     prepareWallpaperBmp,
     type FitMode,
     type PrepareWallpaperResult,
 } from '../services/image_converter';
-import { PANEL_GRAY_LEVELS } from '../services/panel_render';
 import {
     pngBase64ToDataUri,
     rgbaToPngDataUri,
@@ -296,7 +300,7 @@ function formatSize(bytes: number | undefined): string {
 }
 
 export function WallpaperScreen() {
-    const { settings, connectionStatus, settingsLoaded } = useConnection();
+    const { settings, settingsLoaded } = useConnection();
     const { progress, startUpload, setProgress, finishUpload, failUpload } = useProgress();
     const theme = useTheme();
     const styles = useMemo(() => createStyles(theme), [theme]);
@@ -363,7 +367,15 @@ export function WallpaperScreen() {
     const listRequestRef = useRef(0);
 
     const host = settingsLoaded && isHost(settings);
-    const connected = connectionStatus.connected;
+    /**
+     * DIRECT-ONLY, and legitimately so: writing a sleep screen means PUTing a
+     * BMP at the reader's own HTTP API. There is no mailbox road for it and no
+     * outbox to park it in, which is why this screen keeps a hard gate where
+     * Compose lost one — the gate here is TRUE, it just no longer shouts.
+     *
+     * Shared hook, so Wallpaper, Device and History all read one value.
+     */
+    const { available: connected } = useDirectConnectionRequired();
 
     // ── Timers ──────────────────────────────────────────────────────
 
@@ -623,11 +635,12 @@ export function WallpaperScreen() {
 
     const handleUpload = useCallback(
         async (target: UploadTarget) => {
+            // KEPT — the user just tapped an upload button — but re-titled off
+            // "Not connected", which frames the reader's normal state as a
+            // fault, and trimmed to the one sentence that is actually true here:
+            // this particular write has no road but the direct one.
             if (!connected) {
-                Alert.alert(
-                    'Not connected',
-                    "Join the reader's WiFi before changing what it shows while it sleeps."
-                );
+                Alert.alert('Reader asleep', 'The sleep screen can only be changed with the reader awake.');
                 return;
             }
 
@@ -749,10 +762,9 @@ export function WallpaperScreen() {
                 <View style={styles.gateCard}>
                     <WallpaperIcon size={GATE_ICON_SIZE} color={theme.colors.textMuted} />
                     <Text style={styles.emptyTitle}>Host only</Text>
-                    <Text style={styles.emptyText}>
-                        Only the paired host phone can change the sleep screen. Want to
-                        send something anyway? Try Compose instead.
-                    </Text>
+                    {/* One line. The heading already carries the rule; this says
+                        the part it doesn't — that Compose still works. */}
+                    <Text style={styles.emptyText}>Compose still works from here.</Text>
                 </View>
             </View>
         );
@@ -789,10 +801,6 @@ export function WallpaperScreen() {
                 }
             >
                 <Text style={styles.title}>Wallpaper</Text>
-                <Text style={styles.subtitle}>
-                    Set what the reader shows while it sleeps. Host only — this sticks
-                    around even after they dismiss it.
-                </Text>
 
                 {/* Source */}
                 <View style={styles.card}>
@@ -829,11 +837,8 @@ export function WallpaperScreen() {
                                 onChange={setFit}
                                 disabled={busy}
                             />
-                            <Text style={styles.helpText}>
-                                {fit === 'cover'
-                                    ? `Cover fills the whole ${COMPOSE_W} × ${COMPOSE_H} sleep screen — a wide photo will lose a bit off the sides.`
-                                    : 'Fit keeps the whole photo, with a little white border on the sides.'}
-                            </Text>
+                            {/* Caption deleted — the preview below re-encodes on
+                                the switch and shows the crop or the border. */}
                         </>
                     ) : null}
                 </View>
@@ -842,7 +847,22 @@ export function WallpaperScreen() {
                     aspect from composeDimsFor('portrait') rather than a literal
                     — which is what stops this screen drawing a landscape frame
                     for a portrait sleep screen ever again. */}
-                <Text style={styles.sectionTitle}>E-ink preview</Text>
+                <View style={styles.sectionTitleRow}>
+                    <Text style={styles.sectionTitle}>E-ink preview</Text>
+                    {/* THE ONE THING THIS SCREEN CANNOT SHOW. The reader's own
+                        sleep-cover filter lives on the device and no API reads it
+                        back, so the preview is accurate only under the default —
+                        a genuinely invisible consequence, which is the entire
+                        bar for a tip. Everything else that used to be written
+                        here (gray levels, byte count, pixel dimensions, the
+                        fit/crop caveat) is either visible in the picture or of
+                        no use to anyone choosing a photo. */}
+                    <InfoTip
+                        title="E-ink preview"
+                        text="Accurate if the reader is on its default sleep-cover filter; a black-and-white or inverted filter set on the device will look different."
+                        accessibilityLabel="About the e-ink preview"
+                    />
+                </View>
                 <SegmentedControl
                     options={PREVIEW_MODE_OPTIONS}
                     value={previewMode}
@@ -862,27 +882,17 @@ export function WallpaperScreen() {
                     style={styles.devicePreview}
                     testID="wallpaper-device-preview"
                 />
-                <Text style={styles.helpText}>
-                    {previewMode === 'panel'
-                        ? `The reader only shows ${PANEL_GRAY_LEVELS} shades of gray on its ${COMPOSE_W} × ${COMPOSE_H} sleep screen, so this will look a bit grainier and darker than the original — but this preview is pixel-for-pixel what they'll see.`
-                        : 'The smooth 8-bit grayscale inside the BMP. The panel cannot show this — switch to Panel for what it makes of it.'}
-                </Text>
-                <Text style={styles.helpText}>
-                    {preview
-                        ? `8-bit grayscale, ${preview.width} × ${preview.height} — ${formatSize(preview.bmp.length)} BMP for the ${COMPOSE_W} × ${COMPOSE_H} sleep screen.`
-                        : `Grayscale, framed for the ${COMPOSE_W} × ${COMPOSE_H} sleep screen.`}
-                </Text>
-                {/* The reader's sleep-cover settings live on the DEVICE and no
-                    API reads them back, so the preview has to state what it
-                    assumes. Framing to the screen's exact size makes the
-                    fit/crop half moot — both modes render identically at 1:1 —
-                    but the cover FILTER genuinely changes the picture. */}
-                <Text style={styles.helpText}>
-                    Assumes the reader's default sleep-cover filter (standard grayscale).
-                    Because the image is framed to the screen exactly, its Fit/Crop setting
-                    makes no difference — but a black-and-white or inverted filter set on
-                    the device will look different from this.
-                </Text>
+                {/* THREE PARAGRAPHS DELETED HERE. The gray-levels explainer, the
+                    "8-bit grayscale, W × H — N KB BMP" line and the sleep-cover
+                    caveat all sat stacked under the preview.
+                      · The first described what the picture directly above it
+                        was already showing — and DevicePreview's own caption
+                        ('As the panel renders it' / 'The file, not the panel')
+                        says which of the two you are looking at.
+                      · The second was file metadata. Nobody choosing a photo for
+                        their partner's reader is deciding on byte count.
+                      · The third is the only one with information the screen
+                        cannot show, so it moved into the ⓘ on the heading. */}
 
                 {encodeError ? (
                     <View style={styles.errorBanner}>
@@ -905,7 +915,16 @@ export function WallpaperScreen() {
                     </View>
                 ) : null}
 
-                {/* Destinations */}
+                {/* Destinations.
+                    The two captions under these buttons are gone, and so is the
+                    ⓘ that briefly replaced the first one. "Add to rotation" is
+                    answered by the Rotation (n) list further down — the file
+                    appears in it — and the PRECEDENCE between the two is
+                    readable from the layout: the destinations are adjacent, the
+                    primary/secondary weighting already ranks them, and the
+                    rotation list sits directly below its own button. A tip is
+                    for a consequence the screen cannot show, not for one it
+                    shows less emphatically than prose would. */}
                 <View style={styles.sendContainer}>
                     <ActionButton
                         title="Set as sleep screen"
@@ -915,10 +934,6 @@ export function WallpaperScreen() {
                         variant="primary"
                         progress={uploading === 'primary' ? progress : undefined}
                     />
-                    <Text style={styles.helpText}>
-                        Writes /{SLEEP_ROOT_FILENAME}. Sets the one main sleep screen — this
-                        takes priority over the rotation below.
-                    </Text>
                 </View>
 
                 <View style={styles.sendContainer}>
@@ -930,29 +945,26 @@ export function WallpaperScreen() {
                         variant="secondary"
                         progress={uploading === 'set' ? progress : undefined}
                     />
-                    <Text style={styles.helpText}>
-                        Adds a file to {SLEEP_SET_DIR}. The reader shuffles through these
-                        and skips whatever it showed most recently.
-                    </Text>
                 </View>
 
+                {/* WAS: "Not connected — join the reader's WiFi to change what it
+                    shows while it sleeps." Two words now, no colour, and only
+                    because a disabled button with no explanation at all reads as
+                    a bug. The buttons above are already grey. */}
                 {!connected ? (
-                    <Text style={styles.helpText}>
-                        Not connected — join the reader's WiFi to change what it shows
-                        while it sleeps.
-                    </Text>
+                    <Text style={styles.quietNote}>{READER_ASLEEP_CAPTION}</Text>
                 ) : null}
 
                 {/* Device-side prerequisite. Not settable over the wire today, so
                     the wording is the sender's single literal (SLEEP_MODE_HINT)
-                    rather than a copy that can drift from the other screens. */}
+                    rather than a copy that can drift from the other screens.
+                    The subtext under it ("Until it is switched on the device,
+                    uploads land on the SD card but the panel keeps showing the
+                    stock sleep image") is deleted: it restated the hint as a
+                    consequence, and the hint is already an instruction. */}
                 <View style={styles.noticeCard}>
                     <Text style={styles.noticeHeading}>On the reader</Text>
                     <Text style={styles.noticeText}>{SLEEP_MODE_HINT}</Text>
-                    <Text style={styles.noticeSubText}>
-                        Until it is switched on the device, uploads land on the SD card but
-                        the panel keeps showing the stock sleep image.
-                    </Text>
                 </View>
 
                 {/* Rotation manager */}
@@ -976,9 +988,7 @@ export function WallpaperScreen() {
                     <Text style={styles.sectionPath}>{SLEEP_SET_DIR}/*.bmp</Text>
 
                     {!connected ? (
-                        <Text style={styles.emptyListText}>
-                            Connect to the reader to see the rotation set.
-                        </Text>
+                        <Text style={styles.emptyListText}>{READER_ASLEEP_CAPTION}</Text>
                     ) : listLoading && entries.length === 0 ? (
                         <ActivityIndicator
                             size="small"
@@ -1000,9 +1010,8 @@ export function WallpaperScreen() {
                             />
                         ))
                     )}
-                    <Text style={styles.helpText}>
-                        Swipe left, or tap the bin, to remove it from the reader.
-                    </Text>
+                    {/* "Swipe left, or tap the bin, to remove it from the
+                        reader." — the bin is drawn on every row. */}
                 </View>
             </ScrollView>
         </View>
@@ -1106,11 +1115,7 @@ function createStyles(theme: Theme) {
             ...theme.type.h1,
             fontFamily: theme.fonts.display,
             color: theme.colors.text,
-            marginBottom: 6,
-        },
-        subtitle: {
-            ...theme.type.body,
-            color: theme.colors.textMuted,
+            // Was 6 + a subtitle paragraph; the paragraph is gone.
             marginBottom: theme.spacing.xl,
         },
         sectionTitle: {
@@ -1118,6 +1123,18 @@ function createStyles(theme: Theme) {
             color: theme.colors.text,
             marginTop: theme.spacing.xxl,
             marginBottom: theme.spacing.md,
+        },
+        /**
+         * A section heading with its ⓘ on the same line.
+         *
+         * The heading keeps its own marginTop/Bottom, so the row must NOT add
+         * any — otherwise the E-ink preview heading sits at double the spacing
+         * of every other heading on the screen.
+         */
+        sectionTitleRow: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: theme.spacing.sm,
         },
         card: {
             marginTop: theme.spacing.lg,
@@ -1134,11 +1151,20 @@ function createStyles(theme: Theme) {
             marginTop: theme.spacing.lg,
             marginBottom: theme.spacing.sm,
         },
-        helpText: {
+        // `helpText` (six paragraphs on this screen alone), `subtitle` and
+        // `buttonNote` (which centred a ⓘ under the sleep-screen button, since
+        // dropped) are deleted, not left dormant — see the same note in
+        // ComposeScreen. A style with no consumer is an invitation to find one.
+        /**
+         * The two-word "Reader asleep" note. Muted, centred, and deliberately
+         * NOT `danger`: nothing has failed, the reader is simply doing what it
+         * does the overwhelming majority of the time.
+         */
+        quietNote: {
             ...theme.type.caption,
             color: theme.colors.textMuted,
-            lineHeight: 18,
-            marginTop: theme.spacing.sm,
+            textAlign: 'center',
+            marginTop: theme.spacing.md,
         },
         sourceRow: {
             flexDirection: 'row',
@@ -1236,12 +1262,7 @@ function createStyles(theme: Theme) {
             lineHeight: 19,
             color: theme.colors.text,
         },
-        noticeSubText: {
-            ...theme.type.caption,
-            lineHeight: 18,
-            color: theme.colors.textMuted,
-            marginTop: theme.spacing.sm,
-        },
+        // `noticeSubText` went with the sentence it styled.
         section: {
             marginTop: theme.spacing.xxxl,
         },

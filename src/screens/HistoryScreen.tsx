@@ -78,6 +78,7 @@ import { isHost } from '../services/role';
 import { getCurrentIp } from '../services/settings';
 import { SLEEP_MODE_HINT, SLEEP_SET_DIR } from '../services/wallpaper_sender';
 import { Icon, type IconName } from '../components/icons';
+import { useDirectConnectionRequired } from '../components/ConnectionBanner';
 import { useTabBarInset, useTheme, type Theme } from '../theme';
 import { NOTE_SOURCE_FILE_PREFIX } from './ComposeScreen';
 
@@ -110,7 +111,7 @@ interface Banner {
 
 export function HistoryScreen() {
     const navigation = useNavigation<any>();
-    const { settings, connectionStatus, settingsLoaded } = useConnection();
+    const { settings, settingsLoaded } = useConnection();
     const theme = useTheme();
     const styles = useMemo(() => createStyles(theme), [theme]);
     // The tab bar floats over this screen and reserves no layout space, so the
@@ -226,7 +227,17 @@ export function HistoryScreen() {
     // ── Promote ─────────────────────────────────────────────────────
 
     const canPromote = settingsLoaded && isHost(settings);
-    const connected = connectionStatus.connected;
+    /**
+     * Promoting writes a BMP over the reader's HTTP API — direct-only, no
+     * mailbox road, so this genuinely is the `connected` question and not the
+     * deliverability one.
+     *
+     * Taken from the SHARED hook rather than off `connectionStatus` so this
+     * screen ages the observation exactly as Device and Wallpaper do. See the
+     * note on `useDirectConnectionRequired` for why that is the un-decayed
+     * `connected` and not `directNow`.
+     */
+    const { available: connected } = useDirectConnectionRequired();
 
     const handlePromote = useCallback(
         (record: MessageRecord) => {
@@ -284,18 +295,19 @@ export function HistoryScreen() {
                     ) : null}
                 </View>
 
-                <Text style={styles.subtitle}>
-                    Everything you've sent, newest first. Notes are temporary on the
-                    reader — this list is the only lasting copy.
-                </Text>
-
-                {canPromote && records.length > 0 ? (
-                    <Text style={styles.helpText}>
-                        {connected
-                            ? `Tap the picture icon on a note to add it to the reader's ${SLEEP_SET_DIR} rotation. ${SLEEP_MODE_HINT}`
-                            : "Not connected — join the reader's WiFi to add a note to the sleep rotation."}
-                    </Text>
-                ) : null}
+                {/* DELETED, both of them:
+                      · the subtitle ("Everything you've sent, newest first…") —
+                        the list is right there, newest first, and the title
+                        already says History;
+                      · the promote instructions, which branched on `connected`
+                        into "Not connected — join the reader's WiFi to add a
+                        note to the sleep rotation". That line was FALSE-adjacent
+                        (it described a precondition as a failure) and it was
+                        redundant besides: the picture icon on each row is
+                        already disabled, which is the same statement without the
+                        paragraph. The `SLEEP_MODE_HINT` half of it survives
+                        where it can be acted on — inside the success banner
+                        after a promote, and on the Wallpaper tab. */}
 
                 {/* Upload progress lives HERE, not on the row. A promoted
                     wallpaper is ~700 KB streamed in 4 KB chunks, so the
@@ -331,16 +343,11 @@ export function HistoryScreen() {
                 ) : null}
             </View>
         ),
-        [
-            records.length,
-            handleClearAll,
-            busy,
-            canPromote,
-            connected,
-            banner,
-            promotingId,
-            promoteProgress,
-        ]
+        // `canPromote` and `connected` LEFT the list with the promote-instructions
+        // paragraph that read them. Nothing in this header branches on either any
+        // more, and keeping dead deps here is not free: every identity change in
+        // this array re-renders the header during an upload.
+        [records.length, handleClearAll, busy, banner, promotingId, promoteProgress]
     );
 
     // NOTHING THAT TICKS DURING AN UPLOAD MAY APPEAR IN THESE DEPS. Every
@@ -375,10 +382,10 @@ export function HistoryScreen() {
         // out rather than a bare sentence.
         <View style={styles.placeholderCard}>
             <Icon name="history" size={EMPTY_ICON_SIZE} color={theme.colors.textMuted} />
-            <Text style={styles.placeholderText}>
-                Nothing sent yet. Write your first note from Compose and it'll show
-                up here.
-            </Text>
+            {/* One warm line. The button underneath already says where to go,
+                so the sentence no longer has to name Compose or explain that
+                sent notes land here. */}
+            <Text style={styles.placeholderText}>Nothing sent yet.</Text>
             <TouchableOpacity
                 style={styles.emptyAction}
                 onPress={() => navigation.navigate('Compose')}
@@ -606,23 +613,18 @@ function createStyles(theme: Theme) {
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'space-between',
-        marginBottom: 6,
+        // Was 6, when the subtitle underneath supplied the rest of the gap
+        // before the first row. It no longer exists.
+        marginBottom: theme.spacing.lg,
     },
     title: {
         ...theme.type.h1,
         fontFamily: theme.fonts.display,
         color: theme.colors.text,
     },
-    subtitle: {
-        ...theme.type.body,
-        color: theme.colors.textMuted,
-        marginBottom: theme.spacing.md,
-    },
-    helpText: {
-        ...theme.type.caption,
-        color: theme.colors.textMuted,
-        marginBottom: theme.spacing.md,
-    },
+    // `subtitle` and `helpText` are deleted along with the two paragraphs that
+    // used them. Removed rather than left dormant: they are the styles a future
+    // explainer would reach for by name.
     banner: {
         borderRadius: theme.radii.md,
         borderWidth: 1,

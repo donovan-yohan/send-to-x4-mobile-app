@@ -18,6 +18,10 @@
  *   1. **`GET|HEAD` only, and only under one path prefix.** The reader never
  *      publishes (its downloader issues GET, nothing else), so the forwarder is
  *      strictly read-only. Every other method and every other path is refused.
+ *      ONE EXCEPTION, and it is not a forward: the local-only `/cp-wifi`
+ *      handover accepts a `DELETE` as the reader's ack. It is classified before
+ *      the forward prefix is consulted, so nothing about it can reach the
+ *      mailbox — see {@link StartProxyOptions.wifiSharePath}.
  *   2. **The write token is NEVER proxied.** Reads are protected by the
  *      unguessable `boxId` in the path; only publish/status/DELETE are bearer
  *      authenticated. {@link StartProxyOptions} therefore has NO token field —
@@ -302,12 +306,37 @@ export interface ReaderLinkModeEvent {
     error?: string | null;
 }
 
+/**
+ * The WiFi handover, as a state word AND NOTHING ELSE.
+ *
+ * WHY THERE IS NO SSID FIELD HERE. `/cp-wifi` is the one endpoint in the module
+ * that serves a secret, so the native side gives it no telemetry at all: the
+ * request produces no {@link ReaderLinkActivityEvent}, moves no request counter
+ * and no byte counter, and this event's native emit takes a single string. There
+ * is therefore no shape in which the credential could reach a status line, a
+ * console log or a crash report — not even redacted, because "a credential was
+ * asked for, and it was there" is itself the fact worth withholding.
+ *
+ * - `served` — the credential went out on a `GET`. The reader has the bytes and
+ *   has NOT said it saved them, so the phone keeps holding the passphrase.
+ * - `delivered` — the reader acked with `DELETE /cp-wifi`. Native removed the
+ *   staged file before writing that ack, so by the time this arrives the file is
+ *   already gone; this is the ONLY signal the JS staging is wiped on.
+ */
+export type ReaderLinkWifiState = 'served' | 'delivered';
+
+export interface ReaderLinkWifiEvent {
+    kind: 'wifi';
+    state: ReaderLinkWifiState;
+}
+
 export type ReaderLinkEvent =
     | ReaderLinkLinkEvent
     | ReaderLinkProxyEvent
     | ReaderLinkActivityEvent
     | ReaderLinkModeEvent
-    | ReaderLinkDeliveryEvent;
+    | ReaderLinkDeliveryEvent
+    | ReaderLinkWifiEvent;
 
 // ---------------------------------------------------------------------------
 // Call shapes
@@ -379,6 +408,26 @@ export interface StartProxyOptions {
      * manifest holds ids the reader is about to be given anyway.
      */
     outboxManifestPath?: string;
+    /**
+     * Absolute path of the staged WiFi credential — `prepareWifiShareHandover()`
+     * in `services/wifi_share.ts`. OMITTED when nothing is staged, and its
+     * absence is what makes the feature opt-in: with no path the native
+     * `/cp-wifi` endpoint does not exist for the session and 404s every method.
+     *
+     * A PATH, NOT THE VALUES, and unlike every other field on this object it
+     * points at something that IS a secret. That is why it is a path: native
+     * opens the file itself, confines it to this app's own storage, deletes it
+     * the moment the reader acks, and never emits it — where an `ssid` /
+     * `password` pair here would sit in a record that any native validation
+     * message, and anything that ever dumps these options, could echo.
+     *
+     * This is also the one credential the app deliberately hands DOWN the peer
+     * link, and the reason it is safe to: the link is the user's own reader on
+     * an AP they can see, the value is the network the reader is being asked to
+     * join, and the alternative is typing a WPA2 passphrase on e-ink. The
+     * MAILBOX write token still has no field here and never will (rule 2).
+     */
+    wifiSharePath?: string;
 }
 
 export interface ProxyEndpoint {
@@ -535,7 +584,8 @@ export function buildProxyOptions(
     mailboxUrl: string,
     port: number = PROXY_DEFAULT_PORT,
     sessionMaxMs: number = PROXY_SESSION_MAX_MS,
-    outboxManifestPath?: string | null
+    outboxManifestPath?: string | null,
+    wifiSharePath?: string | null
 ): { ok: true; options: StartProxyOptions } | ProxyTargetProblem {
     const target = describeProxyTarget(mailboxUrl);
     if (!target.ok) return target;
@@ -553,6 +603,14 @@ export function buildProxyOptions(
     // native side.
     if (typeof outboxManifestPath === 'string' && outboxManifestPath.length > 0) {
         options.outboxManifestPath = outboxManifestPath;
+    }
+    // SAME RULE, AND IT MATTERS MORE HERE. An always-present key would make a
+    // session that has nothing to share indistinguishable from one that does,
+    // and the native side would then have to decide what an empty path means
+    // for an endpoint whose whole safety property is that it does not exist
+    // unless it was asked for.
+    if (typeof wifiSharePath === 'string' && wifiSharePath.length > 0) {
+        options.wifiSharePath = wifiSharePath;
     }
     return { ok: true, options };
 }
@@ -706,6 +764,11 @@ const EVENT_KINDS: ReadonlyArray<{ name: string; kind: ReaderLinkEvent['kind'] }
     // disagreement, which is the only thing that can.
     { name: 'onProxyMode', kind: 'mode' },
     { name: 'onLocalDelivery', kind: 'delivery' },
+    // The WiFi handover. Contentless by construction (see ReaderLinkWifiEvent),
+    // and the ONLY channel a `/cp-wifi` request has: native emits no activity
+    // event for that target at all, so a build whose Kotlin predates this name
+    // reports the handover nowhere rather than reporting it badly.
+    { name: 'onWifiShare', kind: 'wifi' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -832,6 +895,15 @@ export function coerceReaderLinkEvent(
         const filename = asOptionalString(raw.filename);
         if (filename !== null) delivery.filename = filename;
         return delivery;
+    }
+    if (kind === 'wifi') {
+        // ONE FIELD, AND IT IS AN ALLOWLIST. `delivered` makes the app delete a
+        // passphrase the user typed, so an unrecognised state is dropped rather
+        // than defaulted — and nothing else on the payload is read, so a native
+        // build that ever grew a field here could not smuggle it into JS.
+        const state = raw.state;
+        if (state !== 'served' && state !== 'delivered') return null;
+        return { kind: 'wifi', state };
     }
     if (kind === 'mode') {
         const mode = raw.mode;

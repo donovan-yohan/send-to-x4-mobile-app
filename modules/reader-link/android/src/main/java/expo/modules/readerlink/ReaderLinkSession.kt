@@ -107,6 +107,24 @@ internal class ReaderLinkSession(
   @Volatile
   private var outbox: LocalOutbox? = null
 
+  // --- WiFi handover -----------------------------------------------------------------------
+
+  /**
+   * The staged WiFi credential this session may hand over, or null when `startProxy` was called
+   * without `wifiSharePath`. Null means `/cp-wifi` 404s for every method.
+   */
+  @Volatile
+  private var wifiShare: WifiShareStore? = null
+
+  /**
+   * True once the reader has ACKED the credential this session.
+   *
+   * Kept here as well as emitted for the same reason the delivered id set is: expo POSTS events to
+   * the JS thread, so a reload between the ack and the callback loses it. A JS layer that
+   * reconciles against `getStatus().wifi.delivered` after the session cannot miss the wipe.
+   */
+  private val wifiDelivered = AtomicBoolean(false)
+
   /**
    * True when the session started (or continued) without an internet-capable upstream. It is a
    * REPORTING flag, not a gate: [UpstreamNetwork.current] re-checks per request, so data coming
@@ -256,6 +274,14 @@ internal class ReaderLinkSession(
       localBytesServed.set(0L)
       lastReportedMode = null
 
+      // 2b. The staged WiFi credential, if the caller asked for one. OPT IN: with no path the
+      //     store is null and `/cp-wifi` does not exist for this session. It is deliberately NOT
+      //     read here — the file is opened only when the reader actually asks, so a session that
+      //     never reaches the endpoint never touches the passphrase.
+      val wifiStore = validated.wifiSharePath?.let { WifiShareStore(it, outboxRoots) }
+      wifiShare = wifiStore
+      wifiDelivered.set(false)
+
       // 3. The upstream, BEFORE listening — and REQUIRED only when there is nothing local to hand
       //    over. The original reasoning still holds for that case: the reader gates discovery on
       //    /cp-proxy, so answering 200 there and then 5xx on every read tells the user "the mailbox
@@ -299,15 +325,22 @@ internal class ReaderLinkSession(
         forwardPrefix = validated.forwardPrefix,
         upstreamSupplier = { upstream.current(peer.network) },
         peerNetworkSupplier = { peer.network },
+        // Read per request rather than captured here: DHCP on the reader's soft AP can land
+        // after the listener is up, so a value snapshotted now would be null for the life of the
+        // session on exactly the devices that are slowest to publish it.
+        peerGatewaySupplier = { peer.network?.let { peer.gatewayIpv4(it) } },
         outbox = localOutbox,
+        wifiShare = wifiStore,
         onActivity = { body -> onProxyActivity(body) },
-        onLocalDelivery = { body -> onLocalDelivery(body) }
+        onLocalDelivery = { body -> onLocalDelivery(body) },
+        onWifiShare = { state -> onWifiShareState(state) }
       )
       try {
         server.start()
       } catch (e: Exception) {
         upstream.release()
         outbox = null
+        wifiShare = null
         throw e
       }
       synchronized(proxyLock) { proxy = server }
@@ -436,6 +469,14 @@ internal class ReaderLinkSession(
         "deliveredIds" to localDelivered.toList(),
         "bytesServed" to localBytesServed.get(),
         "startedOffline" to startedOffline
+      ),
+      // THE RECONCILE CHANNEL for the WiFi handover, and deliberately only two booleans: whether
+      // this session can hand a credential over at all, and whether the reader has acked one. The
+      // SSID is not here and the passphrase certainly is not — a status snapshot is exactly the
+      // kind of object that ends up in a bug report.
+      "wifi" to mapOf(
+        "enabled" to (wifiShare != null),
+        "delivered" to wifiDelivered.get()
       ),
       "link" to mapOf(
         "state" to linkState,
@@ -637,6 +678,19 @@ internal class ReaderLinkSession(
     emit(ReaderLinkEvents.LOCAL_DELIVERY, body)
   }
 
+  /**
+   * The WiFi handover, on its own contentless channel.
+   *
+   * The map is BUILT HERE from a single state word the proxy hands up, so this is the whole of the
+   * payload and there is no branch in which more could be added without touching this line. See
+   * [ReaderLinkEvents.WIFI_SHARE]; the request itself produces no activity event and moves no
+   * counter, so this is the only trace it leaves.
+   */
+  private fun onWifiShareState(state: String) {
+    if (state == ProxyContract.WIFI_STATE_DELIVERED) wifiDelivered.set(true)
+    emit(ReaderLinkEvents.WIFI_SHARE, mapOf("state" to state))
+  }
+
   private fun armWatchdog(delayMs: Long) {
     val minutes = delayMs / 60_000L
     val task = Runnable {
@@ -684,6 +738,11 @@ internal class ReaderLinkSession(
     // startProxy clears them.
     val hadOutbox = outbox != null
     outbox = null
+    // The endpoint stops existing with the session. `wifiDelivered` is NOT cleared here, for the
+    // same reason the delivered id set is not: `stopProxy` resolves before JS has read it, and a
+    // session that ends on the watchdog ends with nobody having asked yet. The next startProxy
+    // clears it.
+    wifiShare = null
 
     if (proxyState != "stopped") {
       proxyState = "stopped"

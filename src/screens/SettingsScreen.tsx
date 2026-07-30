@@ -18,8 +18,10 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { useConnection } from '../contexts/ConnectionProvider';
 import { ActionButton } from '../components/ActionButton';
+import { InfoTip, LabelWithTip } from '../components/InfoTip';
 import { SegmentedControl } from '../components/SegmentedControl';
 import { StatusIndicator } from '../components/StatusIndicator';
+import { WifiShareCard } from '../components/WifiShareCard';
 import { useTabBarInset, useTheme, type Theme } from '../theme';
 import { getDefaultIp } from '../services/settings';
 import { fetchMailboxStatus } from '../services/mailbox_client';
@@ -330,17 +332,24 @@ export function SettingsScreen() {
 
                 {/* Role — replaces the old Firmware Type picker. Host sees the
                     Wallpaper and Device tabs; client only composes messages. */}
-                <Text style={styles.sectionTitle}>This Device</Text>
+                <View style={styles.sectionTitleRow}>
+                    <Text style={styles.sectionTitle}>This Device</Text>
+                    {/* EARNS A TIP: the role picker silently adds or removes two
+                        whole tabs (Wallpaper, Library) and changes which roads a
+                        send may take. Nothing about a two-word segmented control
+                        hints at that, and the consequence only shows up after
+                        the user has navigated away. */}
+                    <InfoTip
+                        title="Host or client"
+                        text="Host is the phone paired with the reader over WiFi — it owns the wallpaper and the files. Client sends through the mailbox only."
+                        accessibilityLabel="About host and client"
+                    />
+                </View>
                 <SegmentedControl
                     options={ROLE_OPTIONS}
                     value={localRole}
                     onChange={handleRoleChange}
                 />
-                <Text style={styles.helpText}>
-                    {localRole === 'host'
-                        ? 'Host: paired with the reader over WiFi. Owns wallpaper and device files, and relays incoming messages.'
-                        : 'Client: no direct reader access. Messages are sent through the mailbox.'}
-                </Text>
 
                 {/* Pairing */}
                 <Text style={styles.sectionTitle}>Pairing</Text>
@@ -375,16 +384,27 @@ export function SettingsScreen() {
                     autoCapitalize="none"
                     autoCorrect={false}
                 />
+                {/* The VALIDATION survives — it is triggered by the user's own
+                    typing and it names a real, silent failure (the reader
+                    truncates an over-long URL in a fixed char[128] and still
+                    answers 200). The resting-state explainer under it does not:
+                    the placeholder already shows the shape of the URL, and
+                    "/latest.txt and /current.frame" is a protocol detail nobody
+                    typing into this box has to hold. */}
                 {mailboxUrlWarning ? (
                     <Text style={styles.warningText}>{mailboxUrlWarning}</Text>
-                ) : (
-                    <Text style={styles.helpText}>
-                        Base URL the reader pulls from. Clients publish here; the reader GETs
-                        /latest.txt and /current.frame under it.
-                    </Text>
-                )}
+                ) : null}
 
-                <Text style={styles.fieldLabel}>Mailbox Write Token</Text>
+                <LabelWithTip
+                    label="Mailbox Write Token"
+                    tipTitle="Mailbox write token"
+                    // EARNS A TIP: it cannot be inferred from the label, and
+                    // getting it wrong fails silently at publish time. The
+                    // second half is the security fact that stops someone
+                    // "helpfully" pasting the token into the URL.
+                    tip="Sent as an Authorization header when publishing. It is never written to the reader — keep it out of the URL."
+                    style={styles.fieldLabelRow}
+                />
                 <TextInput
                     style={fieldStyle('mailboxWriteToken')}
                     {...focusProps('mailboxWriteToken')}
@@ -396,10 +416,6 @@ export function SettingsScreen() {
                     autoCorrect={false}
                     secureTextEntry
                 />
-                <Text style={styles.helpText}>
-                    Sent as an Authorization header when publishing. Never written to the reader —
-                    the reader's reads are protected by the unguessable URL alone.
-                </Text>
 
                 <ActionButton
                     title="Test mailbox"
@@ -434,6 +450,18 @@ export function SettingsScreen() {
                             loading={readerSync.busy}
                             disabled={!canProvisionReader}
                         />
+                        {/* EARNS A TIP: this button WRITES PERMANENT STATE to
+                            someone else's device, and it has a precondition the
+                            screen cannot show (the reader awake, in WiFi
+                            transfer mode). A disabled button says "not yet"; it
+                            cannot say "and here is what this would do". */}
+                        <View style={styles.buttonNote}>
+                            <InfoTip
+                                title="Set up reader sync"
+                                text="Writes this mailbox address into the reader and turns on sleep-time sync. The reader has to be awake and in WiFi transfer mode."
+                                accessibilityLabel="About setting up reader sync"
+                            />
+                        </View>
                         {readerSync.message ? (
                             <Text
                                 style={[
@@ -445,10 +473,6 @@ export function SettingsScreen() {
                                 {readerSync.message}
                             </Text>
                         ) : null}
-                        <Text style={styles.helpText}>
-                            Points the reader at this mailbox and turns on sleep-time sync. The
-                            reader must be awake and in WiFi transfer mode.
-                        </Text>
                     </>
                 )}
 
@@ -482,7 +506,27 @@ export function SettingsScreen() {
                     goes only into the platform's Wi-Fi join request.
                     BLANK IS VALID and is the shipping state — the firmware's
                     AP_PASSWORD is a compile-time nullptr, so the AP is open. */}
-                <Text style={styles.fieldLabel}>Reader AP password</Text>
+                <LabelWithTip
+                    label="Reader AP password"
+                    tipTitle="Reader AP password"
+                    // EARNS A TIP: BLANK IS VALID here and is the shipping
+                    // state, which is the opposite of what an empty password
+                    // field means everywhere else on earth. The placeholder says
+                    // that; the tip says the part the placeholder cannot — where
+                    // to find the value.
+                    //
+                    // WHAT IT NO LONGER CLAIMS: 'Saving it lets "Sync with
+                    // reader" join on its own.' That read as "this field is what
+                    // turns Sync on", and it is not — Sync is gated on a
+                    // serveable mailbox base (`isHandoverAvailable`), never on
+                    // this string, which is only handed to the platform's join
+                    // request once a session is already starting. Saving a
+                    // passphrase here unlocks nothing on its own, and copy that
+                    // said otherwise sent users looking for a button that was
+                    // not on their screen.
+                    tip={`Shown on the reader's own Sync screen — ${settings.apSsid} ships with an open AP, so blank is usually right.`}
+                    style={styles.fieldLabelRow}
+                />
                 <TextInput
                     style={fieldStyle('readerApPsk')}
                     {...focusProps('readerApPsk')}
@@ -494,11 +538,14 @@ export function SettingsScreen() {
                     autoCorrect={false}
                     secureTextEntry
                 />
-                <Text style={styles.helpText}>
-                    Used when "Sync with reader" joins {settings.apSsid} directly, so the reader
-                    can pull from the mailbox through this phone's data. Shown on the reader's
-                    Sync screen.
-                </Text>
+
+                {/* The reader's OWN network, handed the other way: the two fields
+                    above describe the reader's access point so this phone can
+                    join it, and this hands the phone's home network to the reader
+                    over that same link so nothing is ever typed on e-ink. It owns
+                    its own state, storage and copy — the screen mounts it and
+                    knows nothing else about it. */}
+                <WifiShareCard />
 
                 {/* Device Host is the LAST configurable section. Two more used to
                     sit here and are deliberately gone:
@@ -523,13 +570,15 @@ export function SettingsScreen() {
                     />
                 )}
 
-                {/* Help */}
-                <View style={styles.helpSection}>
-                    <Text style={styles.sectionTitle}>Help</Text>
-                    <Text style={styles.descriptionText}>
-                        To transfer files directly, your phone must be on the reader's WiFi hotspot ({settings.apSsid}) or the same local network.
-                    </Text>
-                </View>
+                {/* The 'Help' section is GONE. Its single paragraph ("To
+                    transfer files directly, your phone must be on the reader's
+                    WiFi hotspot or the same local network") restated a
+                    precondition that three other surfaces now express as state
+                    rather than prose — the route chip on Compose and Library,
+                    the quiet "Reader asleep" note on Wallpaper, and the
+                    connection card at the top of this very screen. A section
+                    heading called "Help" containing one sentence the app has
+                    already shown the user is furniture. */}
 
                 {/* About */}
                 <View style={styles.aboutSection}>
@@ -592,6 +641,28 @@ function createStyles(theme: Theme) {
             marginBottom: theme.spacing.md,
             marginTop: theme.spacing.xxl,
         },
+        /**
+         * A section heading with its ⓘ alongside.
+         *
+         * Carries NO margins of its own — `sectionTitle` already owns them, and
+         * duplicating them here would give the one tipped section twice the
+         * spacing of every other.
+         */
+        sectionTitleRow: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: theme.spacing.sm,
+        },
+        /** `LabelWithTip` in place of a `fieldLabel`, with the same margins. */
+        fieldLabelRow: {
+            marginBottom: theme.spacing.sm,
+            marginTop: theme.spacing.md,
+        },
+        /** Centres a lone ⓘ under a full-width button. */
+        buttonNote: {
+            alignItems: 'center',
+            marginTop: theme.spacing.sm,
+        },
         inputRow: {
             flexDirection: 'row',
             alignItems: 'center',
@@ -632,6 +703,16 @@ function createStyles(theme: Theme) {
             ...theme.type.label,
             color: theme.colors.textMuted,
         },
+        /**
+         * The LAST surviving caption on this screen, and it survives because it
+         * is DATA, not explanation: the default host and this reader's AP SSID
+         * are two values the user cannot look up anywhere else in the app. Every
+         * other use of this style was a paragraph telling the user what a field
+         * they were already looking at was for; those became ⓘ tips or nothing.
+         *
+         * Do not reintroduce a second consumer without checking it against that
+         * line.
+         */
         helpText: {
             ...theme.type.caption,
             color: theme.colors.textMuted,
@@ -662,13 +743,7 @@ function createStyles(theme: Theme) {
         saveButton: {
             marginTop: theme.spacing.xl,
         },
-        helpSection: {
-            marginTop: theme.spacing.xxl,
-        },
-        descriptionText: {
-            ...theme.type.body,
-            color: theme.colors.textMuted,
-        },
+        // `helpSection` / `descriptionText` went with the Help section.
         aboutSection: {
             marginTop: 40,
             paddingTop: theme.spacing.xxl,
