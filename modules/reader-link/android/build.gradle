@@ -1,0 +1,37 @@
+// Local Expo module (SDK 54 layout). Autolinking finds this project because
+// `expo-modules-autolinking` defaults `nativeModulesDir` to `./modules` when that
+// directory exists — VERIFIED in
+// node_modules/expo-modules-autolinking/build/commands/autolinkingOptions.js
+// (`normalizeAutolinkingOptions`: `resolvePathMaybe('./modules', appRoot)`), and the
+// directory is then scanned by `scanDependenciesInSearchPath`
+// (build/dependencies/scanning.js) + `resolveExpoModule` (build/autolinking/findModules.js),
+// which only requires `expo-module.config.json` to be present. So there is NOTHING to add
+// to app.config.ts: no plugin, no explicit registration.
+//
+// `expo-module-gradle-plugin` is contributed by expo-modules-core itself
+// (node_modules/expo-modules-core/expo-module.config.json -> android.gradlePlugins), and it
+// applies `com.android.library`, `kotlin-android`, `maven-publish`, the SDK versions from the
+// root project and a `compileOnly` dependency on `:expo-modules-core` — see
+// node_modules/expo-modules-core/expo-module-gradle-plugin/src/main/kotlin/expo/modules/plugin/ProjectConfiguration.kt
+// (`applyDefaultPlugins`, `applyDefaultDependencies`, `applyDefaultAndroidSdkVersions`).
+//
+// NO NEW DEPENDENCIES. Everything this module needs is either the Android framework
+// (ConnectivityManager / WifiNetworkSpecifier / ServerSocket / HttpURLConnection) or
+// expo-modules-core. There is deliberately no HTTP-server library and no coroutines
+// dependency: the proxy is a hand-rolled HTTP/1.1 subset on plain threads, so nothing here
+// can drag a transitive dep into the app.
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.readerlink'
+version = '0.1.0'
+
+android {
+  namespace 'expo.modules.readerlink'
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+}

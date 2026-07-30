@@ -1,0 +1,20 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml:1:1-36:12
+INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml:1:1-36:12
+	package
+		INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml
+	xmlns:android
+		ADDED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml:1:11-69
+uses-permission#android.permission.CHANGE_NETWORK_STATE
+ADDED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml:34:3-77
+	android:name
+		ADDED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml:34:20-74
+uses-sdk
+INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml
+INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /home/donovanyohan/Documents/Programs/personal/send-to-x4-mobile-app/modules/reader-link/android/src/main/AndroidManifest.xml

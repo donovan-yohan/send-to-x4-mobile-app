@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
 import type { ConnectionStatus } from '../types';
+import { useTheme, type Theme } from '../theme';
 
 interface StatusIndicatorProps {
     status: ConnectionStatus;
@@ -8,11 +9,14 @@ interface StatusIndicatorProps {
 }
 
 export function StatusIndicator({ status, onRetry }: StatusIndicatorProps) {
+    const theme = useTheme();
+    const styles = useMemo(() => createStyles(theme), [theme]);
+
     return (
         <View style={styles.container}>
             <View style={styles.statusRow}>
                 {status.checking ? (
-                    <ActivityIndicator size="small" color="#666" />
+                    <ActivityIndicator size="small" color={theme.colors.accent} />
                 ) : (
                     <View
                         style={[
@@ -26,8 +30,8 @@ export function StatusIndicator({ status, onRetry }: StatusIndicatorProps) {
                         {status.checking
                             ? 'Checking connection...'
                             : status.connected
-                                ? `Connected to X4 (${status.ip})`
-                                : 'Not connected to X4'}
+                                ? `Connected to reader (${status.ip})`
+                                : "Can't reach the reader right now."}
                     </Text>
                 </View>
                 {!status.connected && !status.checking && onRetry && (
@@ -37,73 +41,77 @@ export function StatusIndicator({ status, onRetry }: StatusIndicatorProps) {
                 )}
             </View>
 
-            {status.connected && (
-                <Text style={styles.firmwareText}>
-                    Firmware: {status.firmwareType === 'crosspoint' ? 'CrossPoint' : 'Stock'}
-                </Text>
-            )}
+            {/* Replaces the old "Firmware: CrossPoint/Stock" line — there is only
+                one firmware now, so the useful thing to show is which half of the
+                pairing this install is. */}
+            <Text style={styles.roleText}>
+                Role: {status.role === 'host' ? 'Host (paired with reader)' : 'Client (sends via mailbox)'}
+            </Text>
 
+            {/* `lastError` VERBATIM — the transport's own message, url and all. */}
             {!status.connected && !status.checking && (
                 <Text style={styles.helpText}>
-                    {status.lastError ? `Error: ${status.lastError}` : 'Connect to X4 WiFi hotspot to send files'}
+                    {status.lastError ? `Error: ${status.lastError}` : "Join the reader's WiFi to send files"}
                 </Text>
             )}
         </View>
     );
 }
 
-const styles = StyleSheet.create({
-    container: {
-        paddingVertical: 12,
-        paddingHorizontal: 16,
-        backgroundColor: '#2d2d44',
-        borderRadius: 12,
-    },
-    statusRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-    },
-    dot: {
-        width: 8,
-        height: 8,
-        borderRadius: 4,
-        marginRight: 8,
-    },
-    dotConnected: {
-        backgroundColor: '#4ade80',
-    },
-    dotDisconnected: {
-        backgroundColor: '#f87171',
-    },
-    textContainer: {
-        flex: 1,
-    },
-    statusText: {
-        color: '#fff',
-        fontSize: 14,
-    },
-    retryButton: {
-        padding: 4,
-        paddingHorizontal: 8,
-        backgroundColor: 'rgba(255, 255, 255, 0.1)',
-        borderRadius: 4,
-        marginLeft: 8,
-    },
-    retryText: {
-        color: '#fff',
-        fontSize: 16,
-        fontWeight: 'bold',
-    },
-    firmwareText: {
-        color: '#666',
-        fontSize: 12,
-        marginTop: 4,
-        marginLeft: 16,
-    },
-    helpText: {
-        color: '#f87171',
-        fontSize: 12,
-        marginTop: 4,
-        marginLeft: 16,
-    },
-});
+function createStyles(theme: Theme) {
+    return StyleSheet.create({
+        container: {
+            paddingVertical: theme.spacing.md,
+            paddingHorizontal: theme.spacing.lg,
+            backgroundColor: theme.colors.surface2,
+            borderRadius: theme.radii.md,
+        },
+        statusRow: {
+            flexDirection: 'row',
+            alignItems: 'center',
+        },
+        dot: {
+            width: 8,
+            height: 8,
+            borderRadius: 4,
+            marginRight: theme.spacing.sm,
+        },
+        dotConnected: {
+            backgroundColor: theme.colors.success,
+        },
+        dotDisconnected: {
+            backgroundColor: theme.colors.danger,
+        },
+        textContainer: {
+            flex: 1,
+        },
+        statusText: {
+            ...theme.type.body,
+            color: theme.colors.text,
+        },
+        retryButton: {
+            padding: theme.spacing.xs,
+            paddingHorizontal: theme.spacing.sm,
+            backgroundColor: theme.colors.surface,
+            borderRadius: theme.radii.sm,
+            marginLeft: theme.spacing.sm,
+        },
+        retryText: {
+            color: theme.colors.accent,
+            fontSize: 16,
+            fontWeight: 'bold',
+        },
+        roleText: {
+            ...theme.type.caption,
+            color: theme.colors.textMuted,
+            marginTop: theme.spacing.xs,
+            marginLeft: theme.spacing.lg,
+        },
+        helpText: {
+            ...theme.type.caption,
+            color: theme.colors.danger,
+            marginTop: theme.spacing.xs,
+            marginLeft: theme.spacing.lg,
+        },
+    });
+}

@@ -1,5 +1,7 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { View, Text, ActivityIndicator, StyleSheet, Modal } from 'react-native';
+
+import { useTheme, type Theme } from '../theme';
 
 interface ProcessingOverlayProps {
     visible: boolean;
@@ -7,11 +9,16 @@ interface ProcessingOverlayProps {
 }
 
 export function ProcessingOverlay({ visible, message = 'Processing...' }: ProcessingOverlayProps) {
+    const theme = useTheme();
+    const styles = useMemo(() => createStyles(theme), [theme]);
+
     return (
         <Modal transparent animationType="fade" visible={visible}>
             <View style={styles.overlay}>
                 <View style={styles.container}>
-                    <ActivityIndicator size="large" color="#0ea5e9" />
+                    <ActivityIndicator size="large" color={theme.colors.accent} />
+                    {/* Carries a per-file upload label ("Uploading 3/7: x.epub… 42%")
+                        straight from ProgressProvider — byte-exact, not reworded. */}
                     <Text style={styles.text}>{message}</Text>
                 </View>
             </View>
@@ -19,30 +26,32 @@ export function ProcessingOverlay({ visible, message = 'Processing...' }: Proces
     );
 }
 
-const styles = StyleSheet.create({
-    overlay: {
-        flex: 1,
-        backgroundColor: 'rgba(0, 0, 0, 0.7)',
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    container: {
-        backgroundColor: '#1e293b',
-        padding: 24,
-        borderRadius: 16,
-        alignItems: 'center',
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.3,
-        shadowRadius: 8,
-        elevation: 10,
-        minWidth: 200,
-    },
-    text: {
-        color: '#e2e8f0',
-        marginTop: 16,
-        fontSize: 16,
-        fontWeight: '600',
-        textAlign: 'center',
-    },
-});
+function createStyles(theme: Theme) {
+    return StyleSheet.create({
+        overlay: {
+            flex: 1,
+            // A warm scrim derived from the palette's own shadow colour, rather
+            // than flat black: over the cream light theme, neutral black reads as a
+            // cold grey sheet.
+            backgroundColor: theme.alpha(theme.colors.shadow, 0.7),
+            justifyContent: 'center',
+            alignItems: 'center',
+        },
+        container: {
+            backgroundColor: theme.colors.surface,
+            padding: theme.spacing.xxl,
+            borderRadius: theme.radii.lg,
+            alignItems: 'center',
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            ...theme.shadows.raised,
+            minWidth: 200,
+        },
+        text: {
+            ...theme.type.button,
+            color: theme.colors.text,
+            marginTop: theme.spacing.lg,
+            textAlign: 'center',
+        },
+    });
+}

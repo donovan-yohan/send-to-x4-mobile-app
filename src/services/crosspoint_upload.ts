@@ -2,6 +2,7 @@ import { readAsStringAsync, EncodingType } from 'expo-file-system/legacy';
 import type { UploadResult, RemoteFile } from '../types';
 import { getDeviceBaseUrl, getDeviceHostForRuntime } from './settings';
 import { formatNetworkError } from './network_errors';
+import { base64ToUint8Array } from '../utils/base64';
 
 // Helper to parse date from filename "Author - YYYY-MM-DD - Title.epub"
 function parseDateFromFilename(filename: string): number {
@@ -29,17 +30,6 @@ function safeDecodeURIComponent(str: string): string {
 
 const DEFAULT_TARGET_FOLDER = 'send-to-x4';
 const TIMEOUT_MS = 300000; // Increased for WS upload (5 minutes)
-
-// Helper: Base64 to Uint8Array
-function base64ToUint8Array(base64: string): Uint8Array {
-    const binaryString = atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-    }
-    return bytes;
-}
 
 /**
  * Upload binary data via WebSocket (Port 81)
@@ -296,15 +286,41 @@ async function ensureFolderExistsCrossPoint(ip: string, folder: string): Promise
     return true;
 }
 
+export interface CrossPointConnectionOptions {
+    /**
+     * Abort the listing request after this many ms. Default 5000 — the value
+     * ConnectionProvider's background check has always used.
+     *
+     * `services/reader_reachability.ts` passes a much shorter one: its probe runs
+     * INSIDE a send, while a user watches, and only has to separate "answers
+     * immediately" from "does not answer".
+     */
+    timeoutMs?: number;
+    /**
+     * On failure, spend up to 3 s more on a root-URL request so the error can say
+     * whether ANYTHING is listening at that host. Default true — that string is
+     * the only diagnostic a user can pass on when the reader "just doesn't
+     * connect".
+     *
+     * FALSE for a probe that is being timed: it more than doubles the worst case
+     * of a check whose whole purpose is to be quick.
+     */
+    diagnostics?: boolean;
+}
+
 /**
  * Check if X4 CrossPoint firmware is reachable
  */
-export async function checkCrossPointConnection(ip: string): Promise<{ success: boolean; error?: string }> {
+export async function checkCrossPointConnection(
+    ip: string,
+    options?: CrossPointConnectionOptions
+): Promise<{ success: boolean; error?: string }> {
     const baseUrl = getDeviceBaseUrl(ip);
     const requestUrl = `${baseUrl}/api/files?path=/`;
+    const timeoutMs = options?.timeoutMs ?? 5000;
     try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
         const response = await fetch(requestUrl, {
             signal: controller.signal,
@@ -319,6 +335,7 @@ export async function checkCrossPointConnection(ip: string): Promise<{ success: 
         }
     } catch (error: unknown) {
         let details = formatNetworkError(error, requestUrl);
+        if (options?.diagnostics === false) return { success: false, error: details };
         try {
             const probeController = new AbortController();
             const probeTimeout = setTimeout(() => probeController.abort(), 3000);

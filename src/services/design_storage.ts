@@ -6,7 +6,7 @@
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import type { CanvasElement } from '../screens/SleepScreenTab';
+import type { CanvasElement } from '../types';
 
 const STORAGE_KEY = '@send-to-x4/design-draft';
 

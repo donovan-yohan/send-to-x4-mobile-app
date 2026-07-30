@@ -1,0 +1,12 @@
+{
+  "name": "xteink-mailbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Capability-URL mailbox that the CrossPoint reader polls at deep-sleep entry.",
+  "//": "type=module is LOAD-BEARING: the repo root package.json has no `type`, so without this node would parse mailbox/src/*.js as CommonJS and `scripts/mailbox_dev_server.mjs` would die on the first `export`. It also keeps wrangler's module resolution unambiguous. This package is not part of the app's dependency tree and is never installed by the root `npm ci`.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  }
+}

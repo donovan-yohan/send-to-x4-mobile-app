@@ -5,6 +5,7 @@ import { uploadScreensaverToCrossPoint } from './crosspoint_upload';
 import { getCurrentIp } from './settings';
 import { generateAndSaveThumbnail } from './thumbnail_generator';
 import * as FileSystem from 'expo-file-system/legacy';
+import { base64ToUint8Array } from '../utils/base64';
 
 export interface ScreensaverDumpResult {
     total: number;
@@ -17,13 +18,7 @@ async function readFileAsUint8Array(uri: string): Promise<Uint8Array> {
     const base64 = await FileSystem.readAsStringAsync(uri, {
         encoding: FileSystem.EncodingType.Base64,
     });
-    const binaryString = atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-    }
-    return bytes;
+    return base64ToUint8Array(base64);
 }
 
 /**
@@ -67,15 +62,11 @@ export async function processScreensaverQueue(
                 bmpFilename = bmp.filename;
             }
 
-            // Upload
-            let uploadResult: UploadResult = { success: false, error: 'Firmware not supported' };
-
-            if (settings.firmwareType === 'crosspoint') {
-                uploadResult = await uploadScreensaverToCrossPoint(ip, bmpData, bmpFilename, onUploadProgress);
-            } else {
-                // TODO: Implement Stock upload if needed, or fallback
-                uploadResult = { success: false, error: 'Screensaver upload only supported on CrossPoint' };
-            }
+            // Upload — CrossPoint only; the stock branch here was already a stub
+            // that returned an error, and went with x4_upload.ts.
+            const uploadResult: UploadResult = await uploadScreensaverToCrossPoint(
+                ip, bmpData, bmpFilename, onUploadProgress
+            );
 
             if (uploadResult.success) {
                 // Generate a local thumbnail mapping for the sent item.

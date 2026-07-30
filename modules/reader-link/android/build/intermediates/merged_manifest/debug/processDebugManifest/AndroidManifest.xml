@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="expo.modules.readerlink" >
+
+    <uses-sdk android:minSdkVersion="24" />
+
+    <!--
+    CHANGE_NETWORK_STATE is what ConnectivityManager.requestNetwork() requires. It is a
+    NORMAL permission (install-time, no runtime prompt), so declaring it here is the whole
+    story for the peer join and for the upstream request.
+
+    It lives in the MODULE manifest, not in app.config.ts, on purpose: `android/` is
+    prebuild output and `expo prebuild` with the clean flag regenerates the app manifest,
+    while a library manifest is merged by the Android manifest merger on every build. Putting
+    it here means the permission cannot be lost by a regeneration.
+
+    ALREADY DECLARED APP-SIDE (app.config.ts `android.permissions`), and still required:
+      - ACCESS_NETWORK_STATE  (reading NetworkCapabilities / LinkProperties)
+      - ACCESS_WIFI_STATE
+      - NEARBY_WIFI_DEVICES   RUNTIME permission; this app targets SDK 36, and per
+                              https://developer.android.com/develop/connectivity/wifi/wifi-permissions
+                              "Apps that target Android 13 (API level 33) or higher and manage
+                              Wi-Fi connections should request the NEARBY_WIFI_DEVICES runtime
+                              permission ... on previous versions of Android, these apps needed
+                              to declare the ACCESS_FINE_LOCATION permission instead."
+                              src/services/android_permissions.ts already requests it.
+      - INTERNET              (the upstream forward)
+
+    NOT declared, deliberately: ACCESS_FINE_LOCATION. On Android 12 and lower the Wi-Fi
+    Network Request API wants it (and location services ON). The target device for this
+    milestone is a Pixel on Android 13+, where NEARBY_WIFI_DEVICES replaces it, and adding a
+    dangerous location permission for older devices would need a runtime-request flow the app
+    does not have. If Android 12 support is ever needed, add
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+                     android:maxSdkVersion="32" />
+    here and extend src/services/android_permissions.ts to request it.
+    -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+</manifest>

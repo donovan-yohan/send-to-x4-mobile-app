@@ -1,13 +1,12 @@
 /**
- * note_sender — Convert a text note to a .txt file and send it to the X4 device.
+ * note_sender — Convert a text note to a .txt file and send it to the reader.
  *
- * Uses the same upload pipeline as articles/screensavers (WebSocket for CrossPoint,
- * HTTP POST for Stock firmware).
+ * Uses the same upload pipeline as articles/screensavers (chunked WebSocket to
+ * CrossPoint firmware).
  */
 
 import type { UploadResult, Settings } from '../types';
 import { uploadToCrossPoint } from './crosspoint_upload';
-import { uploadToStock } from './x4_upload';
 import { getCurrentIp, getNoteFolder, resolveTargetFolder } from './settings';
 
 let lastTitle = '';
@@ -55,10 +54,10 @@ function generateNoteFilename(title?: string): string {
 }
 
 /**
- * Send a text note to the X4 device as a .txt file.
+ * Send a text note to the reader as a .txt file.
  *
  * @param noteText  The raw note text (newlines preserved, UTF-8).
- * @param settings  Current app settings (firmware type + IP).
+ * @param settings  Current app settings (device host + note folder).
  * @param title     Optional title used as the filename.
  * @returns         UploadResult indicating success or failure.
  */
@@ -77,11 +76,7 @@ export async function sendNoteAsTxt(
         console.log(`[NoteSender] Sending note: filename=${filename}, size=${data.length} bytes, ip=${ip}, folder=${noteFolder}`);
     }
 
-    if (settings.firmwareType === 'crosspoint') {
-        return uploadToCrossPoint(ip, data, filename, onProgress, noteFolder);
-    } else {
-        return uploadToStock(ip, data, filename, noteFolder, onProgress);
-    }
+    return uploadToCrossPoint(ip, data, filename, onProgress, noteFolder);
 }
 
 export const __noteSenderTestUtils = {

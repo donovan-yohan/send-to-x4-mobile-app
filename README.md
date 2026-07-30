@@ -1,36 +1,53 @@
-# Send to X4
+# Xteink Messenger
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-**The bridge between the boundless web and your focused Xteink X4.**
+**A private, two-person messenger that writes to an e-ink reader.**
 
-Send to X4 is a mobile app that lets you capture articles, images, and notes from your phone and send them directly to your Xteink X4 e-reader over Wi-Fi — no cloud, no cables, no clutter.
+This app sends short notes and photos from your phone to a CrossPoint-firmware Xteink reader over local Wi-Fi, rendered as an e-ink frame. No cloud, no cables, no accounts.
+
+It is a fork of [Send to X4](https://github.com/Xatpy/send-to-x4-mobile-app), reshaped from a read-it-later utility into a messenger. The article/EPUB pipeline of the original has been removed.
 
 > **⚠️ Disclaimer:** This is an independent, community-developed utility. It is **not** affiliated with or endorsed by Xteink. "Xteink" and "X4" are trademarks of their respective owners.
 
 ---
 
+## 📱 The app
+
+Five tabs. **Wallpaper** and **Device** are host-only — see Roles below.
+
+| Tab | What it does | State |
+|---|---|---|
+| **Compose** | Write a note or pick a photo, render it to an e-ink frame, send it | Placeholder — owns the share intent; editor lands next |
+| **History** | Outbox / message log with delivery status | Placeholder |
+| **Wallpaper** | Send an image as the reader's permanent sleep screen | Working (adapted from the original screensaver flow) |
+| **Device** | Browse and delete files on the reader | Working |
+| **Settings** | Role, pairing, device host, folders | Working |
+
+### Roles
+
+Each install is either a **host** or a **client** (`Settings → This Device`).
+
+- **Host** — physically paired with the reader over Wi-Fi. Owns permanent device state, so it is the only role that sees the Wallpaper and Device tabs.
+- **Client** — has no direct reader access; it composes messages and hands them off. Wallpaper and Device are hidden.
+
+The gate is `isHost()` in `src/services/role.ts`, pinned by `scripts/role.test.js`. Role is read from settings, which are an unversioned storage blob — anything unreadable falls back to a definite role rather than leaking host-only UI.
+
+---
+
 ## ✨ Features
 
-- **Share Sheet Integration** — Share any URL, text snippet, or image directly from other apps into Send to X4.
-- **Advanced Article Extraction** — Strips ads and clutter to extract clean text. Includes a specialized headless-browser engine for rendering X/Twitter threads and preserving article images.
-- **Rich EPUB Generation** — Automatically packages extracted articles into beautiful, book-like EPUBs.
-- **XTC Support** — Native wire-free transfer, formatting, and device management capabilities fully support XTC files.
-- **Rich Note-Taking** — Write customized notes directly in the app and beam them over as plain text (`.txt`) or structured `.epub` documents. Includes custom title support.
-- **Custom Sleep Screen Designer** — Hand-draw your own doodles or create persistent custom designs within the app, then seamlessly beam and apply them as your X4's sleep screen.
-- **Screensaver Image Upload** — Send any image from your gallery directly as a tailored BMP screensaver.
-- **Article Queue & Offline Pre-fetching** — Save articles to a local queue. The app automatically pre-fetches and caches EPUBs, enabling batch-transfers even without an active internet connection.
-- **Smart Date Organization** — Optional automated date-based subfolders (e.g., `yyyy-mm-dd`) keep your growing on-device library beautifully organized.
-- **Print for Hobonichi** — Localized feature that exports content as carefully formatted PDFs suitable for Hobonichi planners.
-- **Direct Wi-Fi Transfer** — Files zip straight from your phone to the e-reader locally. No cloud, no logging, total privacy.
-- **Device File Manager** — Browse, delete, and manage files on your X4 directly from the app.
-- **Dual Firmware Compatibility** — Fully supports both Stock firmware and custom CrossPoint firmware out of the box.
+- **Share Sheet Integration** — Share text or an image from any app; it routes to Compose.
+- **Direct Wi-Fi Transfer** — Chunked WebSocket upload straight from phone to reader. No cloud, no logging.
+- **Sleep Screen / Wallpaper Upload** — Send any gallery image as the reader's sleep screen.
+- **Device File Manager** — Browse and delete files on the reader from the app.
+- **Connection Status** — Continuous reachability probe with an actionable banner, re-checked on foreground.
 
 ---
 
 ## 🛡️ Privacy
 
-Send to X4 is built with a **privacy-first** architecture:
+This app is built with a **privacy-first** architecture:
 
 - All processing happens locally on your device
 - No analytics, no tracking SDKs, no cloud storage
@@ -86,14 +103,17 @@ npx expo start
 ### Running Tests
 
 ```bash
-# Run all tests
+# Typecheck — the only type gate (the test runner is transpile-only)
+npm run typecheck
+
+# Run all tests (node --test over scripts/*.test.js)
 npm run test:all
 
-# Individual test suites
-npm run test:extractor-regressions
-npm run test:extractor-integration
-npm run test:epub-sanitizer
+# A single suite
+node --import tsx --test scripts/folder-sanitize.test.js
 ```
+
+Tests are Node's built-in runner with `tsx` as the TypeScript loader, importing `src/**/*.ts` directly — no bundler, no React Native mocking. A new `scripts/*.test.js` file is picked up by the glob automatically; no config change needed.
 
 ---
 
@@ -101,15 +121,15 @@ npm run test:epub-sanitizer
 
 ```
 send-to-x4-mobile-app/
-├── App.tsx                     # App entry point, navigation setup
+├── App.tsx                     # Entry point; tab + stack nav, share-intent routing
 ├── src/
-│   ├── components/             # Reusable UI components
-│   ├── contexts/               # React context providers (connection state)
-│   ├── screens/                # App screens (Articles, Screensavers, Notes, Device, Settings)
-│   ├── services/               # Core logic (extraction, EPUB, upload, queue)
-│   ├── types/                  # TypeScript type definitions
-│   └── utils/                  # Utilities (EPUB templates, sanitizer)
-├── scripts/                    # Test scripts and build utilities
+│   ├── components/             # Reusable UI (banner, buttons, status, queue list)
+│   ├── contexts/               # ConnectionProvider (settings + reachability), ProgressProvider
+│   ├── screens/                # Compose, History, Wallpaper, Device, Settings
+│   ├── services/               # Transport, encoders, senders, settings, role
+│   ├── types/                  # Shared TypeScript types
+│   └── utils/                  # base64, lock, sanitizer
+├── scripts/                    # Tests and build utilities
 ├── plugins/                    # Custom Expo config plugins
 ├── assets/                     # App icons and splash screen
 └── docs/                       # Product documentation
@@ -119,10 +139,12 @@ send-to-x4-mobile-app/
 
 ## 🔧 How It Works
 
-1. **Share or paste** a URL into the app
-2. The **content extractor** fetches and parses the page using Mozilla Readability (with a specialized engine for complex sites)
-3. The extracted content is **packaged into an EPUB** with clean formatting
-4. The EPUB is **transferred over Wi-Fi** directly to the X4 using the device's native API (Stock or CrossPoint)
+1. **Compose or share** a note or photo into the app
+2. It is **rendered and encoded** to the frame format the reader's firmware expects
+3. The frame is **transferred over local Wi-Fi** to the reader — HTTP on `:80` for listing and mkdir, chunked WebSocket on `:81` for the upload itself
+4. The reader **displays it** on its e-ink panel
+
+The app targets `crosspoint.local` by default and relies on the OS resolving it over the shared LAN; the host is configurable in Settings.
 
 ---
 
@@ -140,25 +162,6 @@ Notes:
 
 - The checked-in `ios/` and `android/` folders are development artifacts. Regenerate them with `npx expo prebuild --clean` after setting `.env` so your local bundle identifiers, app group, and signing settings are applied consistently.
 - CI and local tests are supported on Node 20.x. Newer Node majors may fail on tooling transforms outside the app runtime.
-
----
-
-## 🧪 EPUB Debug Utilities
-
-The app includes hidden EPUB debug/export tooling in:
-
-- `src/screens/ArticlesScreen.tsx`
-
-These utilities are kept in code but disabled in normal UI. Toggle these internal flags near the top of that file:
-
-- `EPUB_DEBUG_TOOLS_ENABLED`: shows the **EXTRACT EPUB (NO UPLOAD)** action in the Articles screen
-- `EPUB_DEBUG_PATH_LOG_ENABLED`: logs the exported EPUB path to the console
-- `EPUB_DEBUG_PATH_ALERT_ENABLED`: shows an alert with the exported EPUB path
-
-Notes:
-
-- This is intended for local debugging and EPUB validation outside the device renderer.
-- Keep all flags set to `false` for production-like behavior.
 
 ---
 

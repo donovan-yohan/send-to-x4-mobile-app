@@ -1,0 +1,7 @@
+{
+  "name": "reader-link",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reader AP peer link + phone-as-mailbox-proxy (Appendix A3). Android-only local Expo module.",
+  "main": "index.ts"
+}

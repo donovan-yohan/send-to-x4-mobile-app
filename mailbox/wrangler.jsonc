@@ -1,0 +1,36 @@
+{
+  // Xteink mailbox — Cloudflare Worker.
+  //
+  // Deploy steps live in README.md. The two placeholders below MUST be filled
+  // in before `wrangler deploy`; they are intentionally NOT real ids so an
+  // accidental deploy fails loudly instead of writing into someone else's
+  // namespace.
+  "name": "xteink-mailbox",
+  "main": "src/worker.js",
+
+  // Bump freely; nothing here depends on a specific runtime date. Lower it if
+  // your installed wrangler warns that this date is past its supported range.
+  "compatibility_date": "2026-07-01",
+
+  // The worker uses only web-standard APIs (URL, Request/Response, TextEncoder,
+  // crypto.getRandomValues), so no compatibility_flags and no nodejs_compat.
+
+  "kv_namespaces": [
+    {
+      "binding": "MAILBOX_KV",
+      // `wrangler kv namespace create MAILBOX_KV` prints this id.
+      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+    }
+  ],
+
+  // WRITE_TOKEN is a SECRET, not a var — never put it here.
+  //   wrangler secret put WRITE_TOKEN
+  // Setting it as a plaintext `vars` entry would commit the app's write
+  // credential to git.
+
+  "observability": {
+    "enabled": true
+  },
+
+  "workers_dev": true
+}

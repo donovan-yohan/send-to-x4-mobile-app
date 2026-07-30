@@ -21,13 +21,26 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         jsEngine: "hermes",
         orientation: "portrait",
         icon: "./assets/icon.png",
-        backgroundColor: "#1a1a2e",
+        // Warm cream paper — lightColors.bg in src/theme/tokens.ts. These three
+        // backgroundColor values (here, splash, android.adaptiveIcon) are what
+        // the OS paints BEFORE any JS runs, so they must move together: leave one
+        // on the old navy and the app flashes #1a1a2e on every cold start no
+        // matter how thoroughly the screens are retokenized.
+        backgroundColor: "#F6EEDF",
         userInterfaceStyle: "automatic",
         newArchEnabled: true,
         splash: {
             image: "./assets/splash-icon.png",
             resizeMode: "contain",
-            backgroundColor: "#1a1a2e",
+            backgroundColor: "#F6EEDF",
+            // Cozy dark: without a dark variant the pre-JS window/splash stays
+            // cream in dark mode (values-night is empty in prebuild output) and
+            // translucent surfaces composite against it.
+            dark: {
+                image: "./assets/splash-icon.png",
+                resizeMode: "contain",
+                backgroundColor: "#231714",
+            },
         },
         ios: {
             supportsTablet: true,
@@ -42,8 +55,10 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         android: {
             versionCode: appJson.expo.android.versionCode,
             adaptiveIcon: {
+                // The foreground PNG is transparent outside the note+heart, so
+                // this flat color IS the icon's background layer.
                 foregroundImage: "./assets/adaptive-icon.png",
-                backgroundColor: "#1a1a2e",
+                backgroundColor: "#F6EEDF",
             },
             package: bundleId || "com.example.sendtox4",
             edgeToEdgeEnabled: true,

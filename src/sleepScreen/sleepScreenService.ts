@@ -1,10 +1,10 @@
 import { Settings } from '../types';
 import { uploadScreensaverToCrossPoint } from '../services/crosspoint_upload';
-import { uploadToStock } from '../services/x4_upload';
 import { getCurrentIp } from '../services/settings';
 import { convertImageToScreensaverBmp } from '../services/image_converter';
 import * as FileSystem from 'expo-file-system/legacy';
 import { generateAndSaveThumbnail } from '../services/thumbnail_generator';
+import { uint8ArrayToBase64 } from '../utils/base64';
 
 export async function processAndSendSleepScreen(
     viewShotUri: string,
@@ -19,15 +19,8 @@ export async function processAndSendSleepScreen(
         // We know the source View is already at the correct aspect ratio, so we don't need to specify sizes
         const { data, filename } = await convertImageToScreensaverBmp(viewShotUri, null, null, customFilename);
 
-        let uploadResult;
-
-        if (settings.firmwareType === 'crosspoint') {
-            // Send to sleep folder on CrossPoint
-            uploadResult = await uploadScreensaverToCrossPoint(ip, data, filename, onProgress);
-        } else {
-            // Upload to stock (we use 'sleep' fallback directory)
-            uploadResult = await uploadToStock(ip, data, filename, 'sleep', onProgress);
-        }
+        // CrossPoint only — the stock-firmware branch went with x4_upload.ts.
+        const uploadResult = await uploadScreensaverToCrossPoint(ip, data, filename, onProgress);
 
         if (uploadResult?.success) {
             // Locally cache the high-quality viewShot to display in the Device tab list
@@ -53,13 +46,4 @@ export async function processAndSaveSleepScreenLocally(
     });
 
     return fileUri;
-}
-
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-    let binary = '';
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
 }

@@ -47,3 +47,4 @@ design/
 # Build artifacts
 *.aab
 *.apk
+test-frames/
