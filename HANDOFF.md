@@ -2,6 +2,12 @@
 
 Fork of `Xatpy/send-to-x4-mobile-app` (MIT) -> the "one app, two roles" companion for an Xteink X3 running a CrossPoint fork. Branch: `messenger`. Firmware is a SEPARATE repo/effort (already at milestone 1, verified on hardware).
 
+## STATUS 2026-07-30 (evening) — shakedown round shipped; one install pending
+
+App repo COMMITTED + PUSHED: donovan-yohan/send-to-x4-mobile-app @ messenger (fork; upstream=Xatpy). CI 791 green. Latest release APK (deliverability model + copy slim-down + WiFi-share + canvas/upload fixes) is BUILT on server-mac (~/xteink-ci/.../app-release.apk) but NOT yet installed — Pixel was unplugged; install with: adb -s 5B120DLCH002TK install -r that path when replugged.
+FIRMWARE m2-4-note-then-wallpaper @ 1f4f51e1 PUSHED, unflashed: note-shows-once+wallpaper-revert, stable/editable AP passphrase, sync-gate breadcrumbs, /cp-wifi pickup (phone shares home WiFi over peer link — fixes the diagnosed EMPTY wifi.json that killed ambient sync; breadcrumb-proven root cause 'WCS Loaded 0'). FLASH THIS, then: app Settings -> Share WiFi with reader -> reader Sync with app -> ambient sync restored; two notes waiting in mailbox will land at next sleep.
+Deliverability model (src/services/deliverability.ts) is now the single connectivity truth — never bypass it in UI gates.
+
 ## STATUS 2026-07-30 (final) — everything shipped; hardware play-testing remains
 
 RELEASE APK on the Pixel (standalone, JS bundled, NO Metro dependency — built on server-mac w/ JDK17, ~/xteink-ci path; devbox CANNOT build release: Kotlin daemon metaspace death, use the mac). Contains ALL features incl. M3 (reader-link Kotlin module: WifiNetworkSpecifier peer join + streaming mailbox proxy) and offline local-serve (outbox: queued notes/books served to the reader over the peer link with ZERO internet; delivery confirmations flip History to 'Delivered directly'). CI 661 green.
