@@ -1,14 +1,14 @@
 {
-  "expo": {
-    "name": "Send to X4",
-    "slug": "send-to-x4",
-    "version": "1.1.22",
-    "ios": {
-      "buildNumber": "33"
-    },
-    "android": {
-      "versionCode": 33,
-      "allowBackup": false
+    "expo": {
+        "name": "Lovenote",
+        "slug": "send-to-x4",
+        "version": "1.1.22",
+        "ios": {
+            "buildNumber": "33"
+        },
+        "android": {
+            "versionCode": 33,
+            "allowBackup": false
+        }
     }
-  }
 }
