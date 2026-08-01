@@ -1048,6 +1048,20 @@ const defaultWifiSharePort: SyncWifiSharePort = {
     discard: discardWifiShareHandover,
 };
 
+/**
+ * What the two staging ports produce, collapsed into the three values
+ * `startProxy` actually takes.
+ *
+ * It exists as a type because the work is now PRE-WARMED — started next to
+ * `join()` rather than after it — so the result has to be carried across an
+ * await boundary instead of being consumed where it was produced.
+ */
+interface PreparedHandover {
+    manifestPath: string;
+    pending: number;
+    wifiSharePath: string;
+}
+
 export interface SyncSessionDeps {
     /** Injected in tests; the app uses the real {@link readerLink}. */
     link?: ReaderLinkApi;
@@ -1096,6 +1110,27 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
 
     /** In-flight native teardown, so `stop()` can await one that it did not start. */
     let releasing: Promise<void> | null = null;
+
+    /**
+     * THE HANDOVER ARTEFACTS, STAGED WHILE THE RADIO IS STILL NEGOTIATING.
+     *
+     * Both halves — re-exporting the outbox manifest (which also collapses the
+     * note queue, and that is AsyncStorage reads plus a History write per
+     * superseded note) and writing the WiFi credential file — used to run
+     * SEQUENTIALLY and only once `joined` had arrived, i.e. squarely between the
+     * reader's AP appearing and the phone's listener binding. The reader is
+     * probing that whole time, and every probe that misses costs it a full poll
+     * interval, so this is dead time the user pays for twice.
+     *
+     * Nothing in either half needs the link, so both start next to {@link
+     * ReaderLinkApi.join} and run concurrently with the association, the system
+     * approval dialog and DHCP. By the time `joined` lands, this promise is
+     * normally already settled and `startProxy` is submitted in the same tick.
+     *
+     * Tagged with the epoch it belongs to: a superseded session's staging is
+     * never fed to a later `startProxy`.
+     */
+    let handover: { epoch: number; promise: Promise<PreparedHandover> } | null = null;
 
     /**
      * True once this session has actually asked for the network.
@@ -1196,6 +1231,7 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
             detach();
             pending = null;
             proxyStarted = false;
+            handover = null;
             if (acquired) {
                 acquired = false;
                 void releaseNative();
@@ -1289,12 +1325,67 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
     };
 
     /**
+     * Stage both handover artefacts, CONCURRENTLY, and never let either fail the
+     * session.
+     *
+     * ARM THE LOCAL SOURCE. The manifest is re-exported per session rather than
+     * at enqueue time only, because the file is what the native side reads and
+     * the phone may have been through an app restart, a cache clear or an OS file
+     * eviction since anything was queued. A queue that cannot be read leaves
+     * `manifestPath` empty, `buildProxyOptions` omits the key, and the session is
+     * exactly the forward-only one that shipped before — which is the correct
+     * degradation, not an error to show.
+     *
+     * ARM THE WIFI CREDENTIAL, on the same terms and with the same degradation.
+     * Nothing staged (or no filesystem) leaves the path empty, `buildProxyOptions`
+     * omits the key, and the native `/cp-wifi` endpoint does not exist for this
+     * session — the correct shape for a user who has never asked to share a
+     * network, not an error to show. It is deliberately NOT dispatched anywhere:
+     * the session says nothing about a credential until the reader has actually
+     * asked for it.
+     *
+     * THE TWO ARE INDEPENDENT — different stores, and deliberately so (see {@link
+     * SyncWifiSharePort}) — so they run together rather than one after the other.
+     * Each swallows its own failure INSIDE its own half, which is what lets the
+     * other still finish.
+     */
+    const prepareHandover = (): Promise<PreparedHandover> => {
+        const queue = (async (): Promise<{ manifestPath: string; pending: number }> => {
+            try {
+                return await outbox.prepare();
+            } catch (error) {
+                console.warn('[SyncSession] Could not arm the handover queue:', error);
+                return { manifestPath: '', pending: 0 };
+            }
+        })();
+        const wifi = (async (): Promise<string> => {
+            try {
+                const staged = await wifiShare.prepare();
+                return staged.pending ? staged.path : '';
+            } catch (error) {
+                console.warn('[SyncSession] Could not arm the WiFi handover:', error);
+                return '';
+            }
+        })();
+        return Promise.all([queue, wifi]).then(([prepared, wifiSharePath]) => ({
+            manifestPath: prepared.manifestPath,
+            pending: prepared.pending,
+            wifiSharePath,
+        }));
+    };
+
+    /**
      * Bring the forwarder up once the peer link exists.
      *
      * Sequenced from JS rather than folded into the native `join` because the two
      * halves fail differently and the user has to be told which one broke: no AP
      * is "start Sync on the reader", a proxy that cannot bind is "something else
      * is on the port".
+     *
+     * THE ONLY WORK LEFT ON THIS PATH IS THE CALL ITSELF. Everything it needs was
+     * staged next to `join()` (see {@link handover}), so `joined` to `startProxy`
+     * is now one already-settled await rather than two round trips through
+     * AsyncStorage and the filesystem.
      */
     const maybeStartProxy = () => {
         if (proxyStarted || !pending) return;
@@ -1302,44 +1393,13 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
         const { options, epoch: mine } = pending;
         if (mine !== epoch) return;
         proxyStarted = true;
+        const staging =
+            handover && handover.epoch === mine ? handover.promise : prepareHandover();
         void (async () => {
-            // ARM THE LOCAL SOURCE FIRST, and never let it fail the session.
-            //
-            // The manifest is re-exported here rather than at enqueue time only,
-            // because the file is what the native side reads and the phone may
-            // have been through an app restart, a cache clear or an OS file
-            // eviction since anything was queued. A queue that cannot be read
-            // leaves `manifestPath` empty, `buildProxyOptions` omits the key, and
-            // the session is exactly the forward-only one that shipped before —
-            // which is the correct degradation, not an error to show.
-            let manifestPath = '';
-            try {
-                const prepared = await outbox.prepare();
-                manifestPath = prepared.manifestPath;
-                if (mine !== epoch) return;
-                if (prepared.pending > 0) {
-                    dispatch({ type: 'armed', at: now(), localItems: prepared.pending });
-                }
-            } catch (error) {
-                console.warn('[SyncSession] Could not arm the handover queue:', error);
-            }
+            const staged = await staging;
             if (mine !== epoch) return;
-
-            // ARM THE WIFI CREDENTIAL, on the same terms and with the same
-            // degradation. Nothing staged (or no filesystem) leaves the path
-            // empty, `buildProxyOptions` omits the key, and the native `/cp-wifi`
-            // endpoint does not exist for this session — which is the correct
-            // shape for a user who has never asked to share a network, not an
-            // error to show. It is deliberately NOT dispatched anywhere: the
-            // session says nothing about a credential until the reader has
-            // actually asked for it.
-            let wifiSharePath = '';
-            try {
-                const staged = await wifiShare.prepare();
-                if (mine !== epoch) return;
-                if (staged.pending) wifiSharePath = staged.path;
-            } catch (error) {
-                console.warn('[SyncSession] Could not arm the WiFi handover:', error);
+            if (staged.pending > 0) {
+                dispatch({ type: 'armed', at: now(), localItems: staged.pending });
             }
             if (mine !== epoch) return;
 
@@ -1347,8 +1407,8 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
                 options.mailboxUrl,
                 options.port ?? PROXY_DEFAULT_PORT,
                 timeouts.sessionMs,
-                manifestPath,
-                wifiSharePath
+                staged.manifestPath,
+                staged.wifiSharePath
             );
             if (!built.ok) {
                 // Unreachable: `start` validated the same string before joining.
@@ -1400,6 +1460,7 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
             detach();
             pending = null;
             proxyStarted = false;
+            handover = null;
             acquired = false;
             void releaseNative();
         }
@@ -1416,6 +1477,7 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
         const mine = epoch;
         pending = null;
         proxyStarted = false;
+        handover = null;
 
         dispatch({ type: 'start', at: now(), ssid: options.ssid });
 
@@ -1469,6 +1531,18 @@ export function createSyncSession(deps: SyncSessionDeps = {}): SyncSessionContro
         acquired = true;
         // Subscribed BEFORE join() so an immediate `onAvailable` cannot be missed.
         attach();
+
+        // STAGED NOW, NOT AFTER `joined`. Neither half touches the link, and the
+        // join ahead of it is seconds of association plus (first time) a system
+        // approval dialog — so this is free time the old ordering spent idle and
+        // then charged to the user again on the far side.
+        //
+        // Placed AFTER `acquired = true` on purpose: the WiFi half writes the
+        // passphrase to a plain file, and `releaseNative()` — which every exit
+        // path from here runs — is what deletes it again. Staging before that
+        // flag is set would be the one window in which a file could outlive the
+        // session that wrote it.
+        handover = { epoch: mine, promise: prepareHandover() };
 
         try {
             await link.join({

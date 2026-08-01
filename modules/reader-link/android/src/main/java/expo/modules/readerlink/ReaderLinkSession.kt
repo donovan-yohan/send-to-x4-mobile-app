@@ -24,7 +24,11 @@ import java.util.concurrent.atomic.AtomicLong
  * order.
  *
  *   joinReaderAp  ->  peer Network granted, phone keeps its default route
- *   startProxy    ->  resolve peer IPv4 -> acquire upstream -> bind listener -> arm the cap
+ *   startProxy    ->  resolve peer IPv4 -> upstream -> bind listener -> arm the cap
+ *                     where "upstream" is a BOUNDED WAIT only when nothing is queued locally, and
+ *                     an outstanding request that nobody waits on when something is. See step 3:
+ *                     with items to hand over the wait cannot change the outcome, and it used to
+ *                     hold the listener down for up to 18 s while the reader probed a closed port.
  *   (reader probes /cp-proxy, then polls /m/{boxId}/...)
  *   stopProxy / leaveReaderAp / cap expiry / link loss  ->  everything released
  *
@@ -282,39 +286,54 @@ internal class ReaderLinkSession(
       wifiShare = wifiStore
       wifiDelivered.set(false)
 
-      // 3. The upstream, BEFORE listening — and REQUIRED only when there is nothing local to hand
-      //    over. The original reasoning still holds for that case: the reader gates discovery on
+      // 3. The upstream, and WHETHER THIS BLOCKS IS DECIDED BY WHAT IS QUEUED. Both branches leave
+      //    the same NetworkRequest outstanding — the acquire keeps it registered whether or not it
+      //    succeeded (see [UpstreamNetwork]), and [armUpstreamRetry] re-checks while the session
+      //    runs. A phone that has just given up its Wi-Fi association to join the reader's AP
+      //    settles SECONDS after this line runs, which is exactly the window a one-shot acquire
+      //    used to lose: one 10 s miss and the session forwarded nothing for its whole life.
+      //
+      //    NOTHING QUEUED — a route is the whole session, so it is waited for and its absence is
+      //    the rejection. The original reasoning holds unchanged: the reader gates discovery on
       //    /cp-proxy, so answering 200 there and then 5xx on every read tells the user "the mailbox
       //    is down" in the one situation they could have fixed (turn data on).
       //
-      //    With items queued, the opposite is true. THIS IS THE ZERO INTERNET CASE the whole local
-      //    serve exists for: a plane, a subway, a phone with no SIM. Refusing to listen because the
-      //    forward would fail would refuse the one delivery that does not need it.
-      //
-      //    AND IT IS NO LONGER A ONE-SHOT. The acquire below leaves its NetworkRequest outstanding
-      //    whether or not it succeeded (see [UpstreamNetwork]), and [armUpstreamRetry] re-checks
-      //    while the session runs. A phone that has just given up its Wi-Fi association to join
-      //    the reader's AP settles SECONDS after this line runs, which is exactly the window this
-      //    used to lose: one 10 s miss and the session forwarded nothing for its whole life.
+      //    ITEMS QUEUED — the wait CANNOT CHANGE ANYTHING THIS SESSION DOES, and it used to cost
+      //    the user up to 18 s (UPSTREAM_DEADLINE_MS + UPSTREAM_FALLBACK_DEADLINE_MS) of a closed
+      //    port while the reader probed it. THIS IS THE ZERO INTERNET CASE the whole local serve
+      //    exists for: a plane, a subway, a phone with no SIM — precisely the phone that pays the
+      //    full 18 s, to reach a branch that then listens anyway. So the request is ARMED and the
+      //    listener goes up now; the 1.5 s retry tick owns the answer from there, and reports it on
+      //    the mode channel the moment it has one.
       startedOffline = false
       upstreamOk = null
       upstreamError = null
       probedUpstream = null
       upstreamOrigin = validated.upstreamOrigin
       requireCellularUpstream = validated.requireCellularUpstream
-      try {
-        upstream.acquire(validated.requireCellularUpstream, ProxyContract.UPSTREAM_DEADLINE_MS)
-      } catch (e: UpstreamUnavailableException) {
-        if (localPending == 0) {
+      if (localPending == 0) {
+        try {
+          upstream.acquire(validated.requireCellularUpstream, ProxyContract.UPSTREAM_DEADLINE_MS)
+        } catch (e: UpstreamUnavailableException) {
           // Nothing local to fall back on, so this session cannot do anything at all. Release the
           // outstanding requests on the way out: the acquire keeps them registered on purpose, and
           // a rejected startProxy leaves nobody to release them later.
           upstream.release()
           throw e
         }
-        startedOffline = true
-        upstreamOk = false
-        upstreamError = e.message
+      } else {
+        try {
+          upstream.arm(validated.requireCellularUpstream)
+        } catch (e: UpstreamUnavailableException) {
+          // A refused requestNetwork is a MISSING PERMISSION, not a settling radio: no retry tick
+          // will fix it, so it is recorded as the observation it is rather than left to the timer.
+          upstreamOk = false
+          upstreamError = e.message
+        }
+        // An OBSERVATION at t=0, not a verdict: "there is no route right now". `upstreamOk` stays
+        // null unless the line above already knew better, so [reportMode] falls back to the shape
+        // of the mode and the first retry tick replaces the guess with a checked answer.
+        startedOffline = upstream.current(peer.network) == null
       }
 
       // 4. Listen.

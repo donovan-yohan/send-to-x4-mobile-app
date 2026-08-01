@@ -270,6 +270,26 @@ internal class UpstreamNetwork(
   }
 
   /**
+   * REGISTERS THE REQUEST AND RETURNS. The same thing [acquire] does first, without the wait.
+   *
+   * WHY IT EXISTS: for a session that already has items queued, the wait in [acquire] cannot change
+   * a single thing the session then does. That branch catches [UpstreamUnavailableException] and
+   * listens anyway, both legs stay registered either way, and [refresh] re-checks on a timer, so the
+   * only effect of blocking was to hold the listening socket down for up to
+   * `UPSTREAM_DEADLINE_MS + UPSTREAM_FALLBACK_DEADLINE_MS` while the reader probed a closed port,
+   * on exactly the phone with no route, which is the offline handover this whole path exists for.
+   *
+   * The CELLULAR leg is deliberately not armed here, for the reason the two-legs note gives: it
+   * would fire the radio up on every session. [refresh] arms it a second later, and only while the
+   * primary is still holding nothing, which keeps the laziness and drops the ten second wait.
+   *
+   * Throws the one failure a retry cannot fix, a missing permission, exactly as [acquire] does.
+   */
+  fun arm(requireCellular: Boolean) {
+    ensurePrimary(requireCellular)
+  }
+
+  /**
    * NON-BLOCKING re-attempt, for the session's mid-session retry.
    *
    * Registers whatever is not registered (including the cellular leg, once the primary has had its
