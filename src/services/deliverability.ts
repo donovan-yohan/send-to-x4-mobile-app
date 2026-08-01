@@ -1,6 +1,6 @@
 /**
- * deliverability — "can this phone get a note or a book to the reader, and by
- * which road?", answered once, for every screen.
+ * deliverability — "can this phone get a note, a book or a sleep screen to the
+ * reader, and by which road?", answered once, for every screen.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS EXISTS: "NOT CONNECTED" WAS NEVER THE QUESTION
@@ -228,6 +228,26 @@ export interface Deliverability {
      * obvious place for it to diverge in, and a failing test pointing at it.
      */
     bookRoute: DeliverabilityRoute;
+    /**
+     * The road a WALLPAPER send would take right now.
+     *
+     * NEW, AND IT USED NOT TO EXIST BECAUSE THE ROAD DID NOT. A sleep screen was
+     * direct-LAN only: `sendWallpaperBmp` PUTs a BMP at the reader's own API, so
+     * WallpaperScreen greyed its buttons out whenever the reader was asleep —
+     * which is almost always — and a client phone could never change a sleep
+     * screen at all. `wallpaper_sender.routeWallpaperSend` now mirrors
+     * `routeEpubLegs` (same role gate, same fast skip, same mailbox fallback,
+     * same outbox auto-arm), so the derivation is identical to
+     * {@link bookRoute}'s and `scripts/deliverability.test.js` pins all three
+     * fields equal across the whole truth table.
+     *
+     * It is a SEPARATE FIELD anyway, for the reason `bookRoute` is: wallpapers
+     * are the likeliest of the three to diverge (the mailbox cap is 4 MiB rather
+     * than 24, and the rotation set has a device-side listing the other two do
+     * not), and when they do there must be one obvious place for it to happen in
+     * with a failing test pointing at it.
+     */
+    wallpaperRoute: DeliverabilityRoute;
     /** The token the UI maps to a chip/copy. Derived from {@link noteRoute}. */
     summary: DeliverabilitySummary;
 }
@@ -393,16 +413,18 @@ export function deriveDeliverability(inputs: DeliverabilityInputs): Deliverabili
 
     const noteRoute = deriveRoute(knowledge, mailboxReady, apHandoverReady);
     const bookRoute = deriveRoute(knowledge, mailboxReady, apHandoverReady);
+    const wallpaperRoute = deriveRoute(knowledge, mailboxReady, apHandoverReady);
 
     return {
         directNow: knowledge === 'reachable',
         mailboxReady,
         apHandoverReady,
-        // Written as an OR over both roads rather than off `noteRoute` alone, so
-        // the field keeps meaning what its name says on the day the two diverge.
-        anyRoute: noteRoute !== 'none' || bookRoute !== 'none',
+        // Written as an OR over every road rather than off `noteRoute` alone, so
+        // the field keeps meaning what its name says on the day they diverge.
+        anyRoute: noteRoute !== 'none' || bookRoute !== 'none' || wallpaperRoute !== 'none',
         noteRoute,
         bookRoute,
+        wallpaperRoute,
         // Notes are the app's primary action and Compose is its home screen, so
         // the one-token summary follows the note road. Books share it today; the
         // test suite is what keeps that true.

@@ -120,6 +120,21 @@ class ReaderLinkModule : Module() {
       promise.resolve(requireSession().statusSnapshot())
     }
 
+    // Name of the Wi-Fi network the phone is on, for the "Share WiFi with reader" prefill.
+    // Resolves { ssid: String?, reason: "ok" | "permission" | "unavailable" | "no-wifi" }.
+    //
+    // DELIBERATELY NOT ROUTED THROUGH ReaderLinkSession. It needs no session, no radio and
+    // no teardown, and requireSession() would make a read that is valid at any time reject
+    // whenever no sync has ever run. [CurrentSsid] takes the context directly and is the
+    // only thing in this module that touches a location-grade API.
+    //
+    // It NEVER rejects: see [CurrentSsid.read]. A null reactContext is reported as
+    // "unavailable" rather than thrown, because the caller is a settings card that must
+    // fall back to a typed field, not a sync session that must fail loudly.
+    AsyncFunction("getCurrentSsid") { promise: Promise ->
+      promise.resolve(CurrentSsid.read(appContext.reactContext))
+    }
+
     OnDestroy {
       session?.shutdown()
       session = null

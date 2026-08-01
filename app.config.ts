@@ -64,6 +64,24 @@ export default ({ config }: ConfigContext): ExpoConfig => {
             edgeToEdgeEnabled: true,
             predictiveBackGestureEnabled: false,
             usesCleartextTraffic: true,
+            // TWO PERMISSIONS THIS LIST DOES NOT CONTAIN, ON PURPOSE.
+            //
+            // CHANGE_NETWORK_STATE and ACCESS_FINE_LOCATION are declared in
+            // modules/reader-link/android/src/main/AndroidManifest.xml instead,
+            // where the manifest merger picks them up on every build. Anything
+            // that only exists in `android/` is prebuild output and can be lost
+            // by a regeneration; a library manifest cannot. That file carries
+            // the full rationale for both.
+            //
+            // NEARBY_WIFI_DEVICES IS DECLARED BARE, with no
+            // `usesPermissionFlags="neverForLocation"` — expo emits a plain
+            // <uses-permission> from this array and nothing in the repo adds
+            // the flag. Do not add it. It is a promise that the app derives no
+            // location from Wi-Fi, and the platform keeps that promise by
+            // redacting exactly the field the "Share WiFi with reader" prefill
+            // reads (WifiInfo.getSSID). src/services/wifi_share.ts used to
+            // state that this app declared the flag; it never did, and that
+            // sentence has been corrected rather than the manifest changed.
             permissions: [
                 "android.permission.ACCESS_NETWORK_STATE",
                 "android.permission.ACCESS_WIFI_STATE",

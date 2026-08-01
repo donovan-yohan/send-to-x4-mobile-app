@@ -15,6 +15,12 @@ at the time of writing. Re-check the line numbers before quoting them in a PR.
 > proposal it is called out inline as **SHIPPED**; those paragraphs, and `core.js`, are the contract.
 > §§3–6 (reader side) are still a plan. `mailbox/README.md` § Books is the operator-facing copy.
 
+> **WALLPAPER RIDES THE SAME MAILBOX — see §2W.** Added after books shipped, additive to every note
+> and book key/route/byte. Unlike §§3–6, **both** halves of §2W are shipped and gated: the server and
+> app in this repo, the reader in `crosspoint-reader@develop` (`src/network/WallpaperSync.cpp`).
+> Read §2W before touching wallpaper ordering anywhere — `wallpaper.txt` is NEWEST LAST while
+> `books.txt` and `/status` are NEWEST FIRST, and that is deliberate in all three cases.
+
 ---
 
 ## 1. Model — why there are no acks
@@ -207,6 +213,186 @@ write it to, so decide now whether `filename` is "rest of line" (it is, today) o
 > `Content-Range` versus the `bytes` it read from `books.txt`. A same-size replacement is undetectable.
 > The app should mint a new id for different content; the reader must compare those two numbers on
 > every window and restart the download when they disagree (§3 step 6).
+
+---
+
+## 2W. Wallpaper wire contract — the sleep screen over the same mailbox
+
+> **SHIPPED, ALL THREE HALVES.** Server: `mailbox/src/core.js` (asserted by `scripts/mailbox-core.test.js`,
+> smoked over a real socket against `scripts/mailbox_dev_server.mjs`). App: `src/services/mailbox_client.ts`
+> + `src/services/wallpaper_sender.ts` + `modules/reader-link/.../LocalOutbox.kt` (asserted by
+> `scripts/wallpaper-mailbox.test.js`). Reader: `src/network/WallpaperSync.cpp` on `crosspoint-reader@develop`.
+> This section is the contract; where a builder's prose and this section disagree, this section wins.
+
+Wallpaper used to be direct-LAN only: the app PUT a BMP at the reader's own web server, so a host who
+was not on that network had **no route at all** and a client phone could never set a sleep screen. It
+now rides the mailbox, collected on the reader's own sync windows, exactly as notes and books do.
+Additive throughout — no note or book key, route or byte changes.
+
+Store keys: `box:{id}:wallpapers:index` (the manifest) and `box:{id}:wallpaper:{wpId}` (one blob).
+`wallpaper:` vs `wallpapers:` keeps the dev server's `:`→`_` key-to-filename mapping injective, the
+same trick `book:`/`books:` uses.
+
+### `GET|HEAD {base}/wallpaper.txt` — manifest (no auth)
+
+`text/plain; charset=utf-8`, one line per pending item, **`Content-Length` measured in bytes**, empty
+body when nothing is pending.
+
+```
+{id} {bytes} {target} {filename}\n
+```
+
+```
+# wp-01JS4K2M9-abc 418992 set dune-2026.bmp
+# wp-01JS4M8Q1-def 418992 primary -
+```
+
+- **NEWEST LAST.** This is the single most important difference from `books.txt`, which is newest
+  first. `books.txt` is a *set the reader picks from*; `wallpaper.txt` is a **sequence the reader
+  applies**, and the last primary written wins `/sleep.bmp`. A reader that drains the manifest in
+  order therefore has to finish on the newest primary. The reversal lives in exactly one function
+  (`renderWallpaperManifest`); the stored index is newest-first so eviction and replacement stay the
+  same three lines as books.
+- **`filename` is the literal `-` for every `primary`.** A primary has one fixed destination and no
+  name; the placeholder exists only so a C string walk keeps its field count. A rotation entry
+  literally named `-` is refused by every half for that reason.
+- `id`, `bytes` and `target` contain no space by construction; `filename` is **the rest of the line**
+  and may itself contain spaces. Parse as "up to the first three spaces, then the remainder to LF".
+- Printable ASCII only, so one character is one byte and a byte offset cannot disagree with a
+  character offset.
+
+### `GET|HEAD {base}/wallpaper/{id}` — the bytes (no auth)
+
+`200 image/bmp` + `Accept-Ranges: bytes`. **Byte-for-byte the books path** — same `parseByteRange`,
+same clamping, same ignore-vs-416 split:
+
+```
+# resume from byte 655360
+# HTTP/1.1 206 Partial Content
+# content-range: bytes 655360-1116053/1116054
+# content-length: 460694
+#
+# past the end
+# HTTP/1.1 416 Range Not Satisfiable
+# content-range: bytes */1116054
+```
+
+A multi-range or unknown-unit `Range` is **ignored** (→ `200` full body), a well-formed unsatisfiable
+one is `416`, and a last-byte-pos past the end is **clamped**. `Content-Disposition` is present only
+for `target=set`; a primary has no filename to disclose and inventing one would name a file the
+reader must not create.
+
+> **THE 206 START CHECK IS LOAD-BEARING HERE AND THE READER OWNS IT.** There is no ETag and no
+> `If-Range`, so a 206 whose `Content-Range` start is not the offset that was asked for must be
+> treated as `RANGE_IGNORED` and the file restarted from 0 — appending it at the requested offset
+> produces a file that is corrupt in the middle and exactly the length the manifest promised, and a
+> size match is the only integrity gate this contract affords. Shipped in `HttpDownloader`
+> (`crosspoint-reader@e1884002`); `WallpaperSync` inherits it by using the same `resumeToFile`.
+
+### `POST {base}/wallpaper` — publish (bearer)
+
+| header | rule |
+| --- | --- |
+| `X-Wallpaper-Id` | `[A-Za-z0-9._~-]{1,64}`; `.` and `..` refused (the id becomes a store key, a path segment and a staging filename) |
+| `X-Wallpaper-Target` | `primary` or `set`. Trimmed and lowercased; **anything else is `400`, never a default** — silently picking one would overwrite a sleep screen the user meant to add to the rotation |
+| `X-Filename` | **REQUIRED when `target=set`**, sanitized `*.bmp`, ≤ 120 chars. **IGNORED ENTIRELY when `target=primary`** — not "optional": the header is not read at all on that target |
+
+Body: BMP bytes, `1 .. MAX_WALLPAPER_BYTES`.
+
+```
+# {"ok":true,"id":"wp-01JS4M8Q1-def","target":"primary","filename":null,"bytes":1116054}
+```
+
+`401` (checked **before** the body is buffered) · `400` · `413 {"error":"wallpaper_too_large"}` ·
+`503 {"published":false}`.
+
+`MAX_WALLPAPER_BYTES = 4 MiB (4194304)`. A 1056-long-side 8bpp BMP is ~1.1 MB, so 4 MiB is headroom
+and still far under KV's 25 MiB value ceiling. The cap is a **predicate**, not a route list — both
+adapters branch on `requestBodyLimit(method, path).bytes > MAX_REQUEST_BODY_BYTES`, which is why
+`POST /wallpaper` inherited per-route capping *and* the pre-body `401` with no adapter change.
+
+### `DELETE {base}/wallpaper/{id}` — unpublish (bearer) → `200` / `404`
+
+Body `{"ok":true,"id","target","filename"}`. Stops the picture being **advertised**; a reader that
+already applied it keeps its copy, because reader-side state is authoritative and there is no reverse
+channel.
+
+### Retention
+
+- `MAX_WALLPAPERS = 8` pending per box; the 9th evicts the **oldest** (index entry *and* blob).
+- Re-POSTing the **same id** replaces it. That is what a retry is.
+- A new `primary` **supersedes** any earlier undelivered `primary` — the old index entry and its blob
+  both go. There is one `/sleep.bmp`, so a queue holding three primaries is two wake windows of radio
+  spent to be overwritten.
+- **`set` items are NOT deduplicated by filename**, unlike books. Books collapse same-filename
+  entries because the reader's SD-card diff would otherwise be unresolvable; a wallpaper has an
+  id-keyed done-state and no filename diff, so collapsing would silently drop a queued item.
+- The read path enforces the invariants too: a corrupted index cannot advertise two pending primaries
+  and cannot exceed `MAX_WALLPAPERS`.
+
+### `GET {base}/status` (bearer) — gains `wallpapers: [{id, target, filename, bytes}]`
+
+Always present as an array (`[]` on a box that never held one).
+
+> **THE TWO ORDERS ARE OPPOSITE AND BOTH ARE CORRECT. Read this before touching either.**
+> `/status` is **NEWEST FIRST** (it serves the stored index, which publish builds as
+> `[entry, ...kept]` — the same order `books` uses). `wallpaper.txt` is **NEWEST LAST**. Only
+> `renderWallpaperManifest` reverses, and only for the firmware's wire. `/status` is JSON for a
+> human-facing list; nothing applies it in order. A UI that wants newest-first renders `/status` as it
+> arrives — reversing it yields oldest-first. This shipped wrong once already in `WallpaperScreen`
+> and is now pinned by `scripts/wallpaper-mailbox.test.js`
+> (`/status is NEWEST FIRST and wallpaper.txt is its exact reverse`).
+
+> **`filename` IS `null` IN JSON AND `-` ON THE WIRE.** The `-` is a positional placeholder for a
+> firmware line parser, not a name; putting it in JSON would invent a filename the reader must not
+> use. `POST` 200, `DELETE` 200 and `/status` all carry `null` for a primary. The app coerces that to
+> `''`. Do not "harmonise" these.
+
+**What the contract does NOT give you:** no content hash, exactly as for books. `bytes` is the only
+integrity signal, so a same-size replacement under the same id is undetectable — mint a new id for
+different content. The reader adds one gate books do not have: the completed blob is parsed with the
+**same `Bitmap::parseHeaders()` the sleep renderer uses** before it is applied, because a wallpaper is
+read on a code path with no user in front of it.
+
+### Reader-side application
+
+| target | destination |
+| --- | --- |
+| `primary` | `/sleep.bmp` |
+| `set` | `/.sleep/<filename>` |
+
+- **Done-state is id-keyed, never filename-keyed**, and lives in `/.crosspoint/mailbox-wallpaper-state`
+  as `"{id} {verdict}\n"`, newest first, ≤ 48 entries. `done` = applied; `skip` = arrived byte-complete
+  and failed the BMP parse, so it must never be re-fetched. Both verdicts mean "do not fetch this id".
+  Filename-keyed would deliver exactly one primary, ever — every primary lands on the same path.
+- **Staging is `/.crosspoint/wallpaper/{id}`, deliberately NOT under `/.sleep`.** `SleepActivity` picks
+  "`/.sleep` if it exists, else `/sleep`" and does **not** fall back when `/.sleep` exists but holds no
+  usable BMP, so parking a partial there would silently retire a user's legacy `/sleep` rotation for
+  the length of the download. `/.sleep` is created only when a `set` item is actually applied into it.
+- **The partial IS the resume state** and is never deleted on transport failure (§4's rule).
+- **Apply is remove-then-rename**, because `Storage.rename()` does not overwrite. Between the two the
+  slot is *absent*, never half-written: the sleep renderer sees the old wallpaper, or nothing (and
+  falls through to its next choice), or the complete new one. A power cut in that gap leaves the
+  complete staging file and no state line, so the next window re-applies it from disk with no network.
+- **State is written only after the file reaches its final resting place.** An id recorded for a
+  wallpaper that is not there strands it for ever.
+- The scan takes the **OLDEST unapplied** entry (first id not in the state file) — the other half of
+  the newest-last ordering. One item per window.
+- A delivered `primary` also selects `SLEEP_SCREEN_MODE::CUSTOM` (precedent:
+  `BmpViewerActivity::doSetSleepCover()`). Without it, a reader on `DARK`/`BLANK`/`COVER` takes the
+  bytes and changes nothing, which is indistinguishable from a broken mailbox. **Not** done for `set`:
+  adding to a rotation is not an instruction to switch modes.
+
+### The phone as proxy (§A3) — one inversion
+
+`MailboxProxyServer` merges the remote and local `wallpaper.txt` **REMOTE FIRST, LOCAL LAST** — the
+opposite of the `books.txt` merge, for the same reason the wire order is inverted: the local queue is
+what this phone was asked for most recently, so it must come last or a stale remote primary would
+overwrite the picture the user just chose. Local wins an id or a lowercased-filename collision, only
+the last primary survives the merge, and the result is capped to `MAX_WALLPAPERS` **from the end**
+(the tail is the newest and must not be dropped). This inversion is the thing a later "symmetry"
+refactor will silently break; the failure is the panel ending on a stale primary, which nothing
+reports.
 
 ---
 

@@ -116,8 +116,12 @@ private const val NO_UPSTREAM_NOTE = "no internet through this phone, so the mai
  *                   body stays inside the reader's 8 KB read cap. A remote fetch that fails degrades
  *                   to local only rather than failing the window.
  *   - `books/{id}`  local bytes when the id is ours, with FULL Range support, otherwise forwarded.
+ *   - `wallpaper.txt` union like `books.txt` but REMOTE FIRST AND LOCAL LAST, because this manifest
+ *                   is a SEQUENCE the reader applies rather than a set it picks from, and the last
+ *                   primary applied wins `/sleep.bmp`. Only the last primary survives the merge.
+ *   - `wallpaper/{id}` local bytes when the id is ours, Range and all, otherwise forwarded.
  *
- * NEVER A 5xx ON THE FOUR CONTRACT ENDPOINTS. With no upstream and nothing local the honest answers
+ * NEVER A 5xx ON THE CONTRACT ENDPOINTS. With no upstream and nothing local the honest answers
  * are an empty `latest.txt`, an empty `books.txt` and a 404 for a body — all of which the reader
  * already treats as a normal, self healing window.
  *
@@ -619,7 +623,11 @@ internal class MailboxProxyServer(
       MailboxEndpoint.BOOKS_MANIFEST ->
         serveBooksManifest(request, out, includeBody, snapshot, upstream, mode)
       MailboxEndpoint.BOOK_BODY ->
-        serveBookBody(request, out, includeBody, snapshot, upstream, mode, target.bookId)
+        serveBookBody(request, out, includeBody, snapshot, upstream, mode, target.itemId)
+      MailboxEndpoint.WALLPAPER_MANIFEST ->
+        serveWallpaperManifest(request, out, includeBody, snapshot, upstream, mode)
+      MailboxEndpoint.WALLPAPER_BODY ->
+        serveWallpaperBody(request, out, includeBody, snapshot, upstream, mode, target.itemId)
       MailboxEndpoint.OTHER -> {
         if (upstream == null) {
           // Not a contract endpoint, so there is no honest local answer and no reader behaviour
@@ -842,7 +850,7 @@ internal class MailboxProxyServer(
     var upstreamOk: Boolean? = null
     var upstreamNote: String? = null
     if (upstream != null) {
-      val fetched = fetchRemoteBooksManifest(request, upstream)
+      val fetched = fetchRemoteManifest(request, upstream, "books.txt")
       remoteLines = fetched.lines
       if (remoteLines == null) {
         // The forward failed while the reader waits. Answering the local set is a normal window;
@@ -932,6 +940,117 @@ internal class MailboxProxyServer(
     // next window. Never a 5xx.
     HttpWire.writeStatusOnly(out, 404, includeBody)
     return ForwardResult(404, 0L, "offline: book not in the outbox", ProxyContract.SOURCE_LOCAL, mode)
+  }
+
+  /**
+   * `wallpaper.txt`, merged exactly as [serveBooksManifest] merges `books.txt` and failing exactly
+   * as softly: an unreachable mailbox degrades to "local only" with `upstreamOk = false` rather than
+   * to a 502, because an empty or short manifest never DELETES anything on the reader.
+   */
+  private fun serveWallpaperManifest(
+    request: ProxyRequest,
+    out: OutputStream,
+    includeBody: Boolean,
+    snapshot: OutboxSnapshot?,
+    upstream: Network?,
+    mode: String
+  ): ForwardResult {
+    val localLines = snapshot?.wallpaperLines() ?: emptyList()
+    var remoteLines: List<String>? = null
+    var note: String? = null
+    var upstreamOk: Boolean? = null
+    var upstreamNote: String? = null
+    if (upstream != null) {
+      val fetched = fetchRemoteManifest(request, upstream, "wallpaper.txt")
+      remoteLines = fetched.lines
+      if (remoteLines == null) {
+        note = "remote wallpaper.txt unavailable; served local only"
+        upstreamOk = false
+        upstreamNote = fetched.error ?: note
+      } else {
+        upstreamOk = true
+      }
+    }
+
+    val merged = mergeWallpaperLines(remoteLines ?: emptyList(), localLines)
+    val builder = StringBuilder(merged.size * 64)
+    for (line in merged) builder.append(line).append('\n')
+    val body = builder.toString().toByteArray(Charsets.US_ASCII)
+
+    HttpWire.writeLocalResponse(
+      out,
+      200,
+      body,
+      ProxyContract.TEXT_CONTENT_TYPE,
+      includeBody,
+      mailboxHeaders()
+    )
+
+    val source = when {
+      localLines.isEmpty() -> if (remoteLines != null) ProxyContract.SOURCE_UPSTREAM else ProxyContract.SOURCE_LOCAL
+      remoteLines.isNullOrEmpty() -> ProxyContract.SOURCE_LOCAL
+      else -> ProxyContract.SOURCE_MERGED
+    }
+    return ForwardResult(
+      200,
+      if (includeBody) body.size.toLong() else 0L,
+      note,
+      source,
+      mode,
+      upstreamOk = upstreamOk,
+      upstreamNote = upstreamNote
+    )
+  }
+
+  /** `wallpaper/{id}`, answered from the outbox when it holds that id, else forwarded. */
+  private fun serveWallpaperBody(
+    request: ProxyRequest,
+    out: OutputStream,
+    includeBody: Boolean,
+    snapshot: OutboxSnapshot?,
+    upstream: Network?,
+    mode: String,
+    wallpaperId: String?
+  ): ForwardResult {
+    val wallpaper = if (wallpaperId == null) null else snapshot?.wallpaper(wallpaperId)
+    if (wallpaper != null) {
+      return serveLocalBody(
+        wallpaper,
+        ProxyContract.WALLPAPER_CONTENT_TYPE,
+        // NO Content-Disposition, unlike a book: the reader does not choose where a wallpaper
+        // lands, the `target` field of the manifest line does, and a filename header suggesting
+        // otherwise is one more thing that could disagree with it.
+        null,
+        request,
+        out,
+        includeBody,
+        mode
+      )
+    }
+    if (upstream != null) {
+      val forwarded = forward(request, out, includeBody, upstream, deferFailure = true)
+      if (forwarded.status != 0) {
+        return forwarded.copy(source = ProxyContract.SOURCE_UPSTREAM, mode = mode)
+      }
+      HttpWire.writeStatusOnly(out, 404, includeBody)
+      return ForwardResult(
+        404,
+        0L,
+        forwarded.note,
+        null,
+        mode,
+        upstreamOk = false,
+        upstreamNote = forwarded.upstreamNote ?: forwarded.note
+      )
+    }
+    HttpWire.writeStatusOnly(out, 404, includeBody)
+    return ForwardResult(
+      404,
+      0L,
+      "offline: wallpaper not in the outbox",
+      ProxyContract.SOURCE_LOCAL,
+      mode
+    )
   }
 
   /**
@@ -1081,7 +1200,19 @@ internal class MailboxProxyServer(
    * parsed rather than relayed, and the budget is far shorter than a forward's, because the reader
    * is holding a peer connection open while this runs.
    */
-  private fun fetchRemoteBooksManifest(request: ProxyRequest, upstream: Network): RemoteManifest {
+  /**
+   * One remote TEXT manifest, fetched inline while the reader waits.
+   *
+   * `label` names the endpoint in the error strings ONLY. The path fetched is always
+   * `request.target`, so this function cannot fetch something other than what the reader asked for
+   * no matter what the label says; it was generalised from a books-only helper when `wallpaper.txt`
+   * arrived, and a wrong label is a confusing status line rather than a wrong request.
+   */
+  private fun fetchRemoteManifest(
+    request: ProxyRequest,
+    upstream: Network,
+    label: String
+  ): RemoteManifest {
     val url = try {
       URL(upstreamOrigin + HttpWire.pathOf(request.target))
     } catch (e: Exception) {
@@ -1102,19 +1233,19 @@ internal class MailboxProxyServer(
       applyUpstreamHeaders(connection, null)
       val status = connection.responseCode
       if (status != 200) {
-        return RemoteManifest(null, "the mailbox answered $status for books.txt")
+        return RemoteManifest(null, "the mailbox answered $status for $label")
       }
 
       val body = ByteArrayOutputStream(4096)
       val stream = connection.inputStream
-        ?: return RemoteManifest(null, "the mailbox sent no body for books.txt")
+        ?: return RemoteManifest(null, "the mailbox sent no body for $label")
       val buffer = ByteArray(4096)
       while (true) {
         val read = stream.read(buffer)
         if (read < 0) break
         if (read == 0) continue
         if (body.size() + read > ProxyContract.REMOTE_MANIFEST_MAX_BYTES) {
-          return RemoteManifest(null, "the mailbox books.txt is larger than this proxy will read")
+          return RemoteManifest(null, "the mailbox $label is larger than this proxy will read")
         }
         body.write(buffer, 0, read)
       }
@@ -1184,6 +1315,107 @@ internal class MailboxProxyServer(
     if (bytes.isEmpty() || bytes.any { !it.isDigit() }) return null
     if (!LocalOutbox.isValidBookFilename(filename)) return null
     return id to filename
+  }
+
+  /**
+   * Union of the two wallpaper manifests, REMOTE FIRST AND LOCAL LAST.
+   *
+   * THE ORDER IS INVERTED FROM [mergeBookLines] AND THAT IS THE WHOLE DESIGN. `books.txt` is a set
+   * the reader picks from, so "local first" simply means the phone's copies are seen first.
+   * `wallpaper.txt` is a SEQUENCE the reader APPLIES, newest last, and the last primary applied
+   * wins `/sleep.bmp`. The local queue is what this phone was asked for most recently, so it has to
+   * come last or a stale remote primary would overwrite the picture the user just chose.
+   *
+   * LOCAL STILL WINS A COLLISION, on an id (the same wallpaper queued and published) or on a
+   * lowercased filename (a re-send under a fresh id). Two entries naming one file is what section 2
+   * refuses server side, because the reader would have two downloads racing for one destination.
+   *
+   * ONLY THE LAST PRIMARY SURVIVES, which is section 2's own retention rule ("a new primary
+   * supersedes any earlier undelivered primary") applied to the MERGED view. Without it a phone
+   * holding one primary and a mailbox holding another would make the reader spend two wake windows
+   * to end up exactly where one would have.
+   *
+   * Capped at [ProxyContract.MAX_WALLPAPERS] from the END, not the start: the tail is the newest
+   * and is the part that must not be dropped.
+   *
+   * Remote lines are re-validated rather than trusted, because this process now owns the framing.
+   */
+  private fun mergeWallpaperLines(
+    remoteLines: List<String>,
+    localLines: List<String>
+  ): List<String> {
+    val localKept = ArrayList<String>(localLines.size)
+    val ids = HashSet<String>()
+    val names = HashSet<String>()
+    for (line in localLines) {
+      val parsed = parseWallpaperLine(line) ?: continue
+      if (!ids.add(parsed.first)) continue
+      if (parsed.third.isNotEmpty() && !names.add(parsed.third.lowercase(Locale.ROOT))) continue
+      localKept.add(line)
+    }
+
+    val remoteKept = ArrayList<String>(remoteLines.size)
+    for (line in remoteLines) {
+      val parsed = parseWallpaperLine(line) ?: continue
+      if (ids.contains(parsed.first)) continue
+      if (parsed.third.isNotEmpty() && names.contains(parsed.third.lowercase(Locale.ROOT))) continue
+      ids.add(parsed.first)
+      if (parsed.third.isNotEmpty()) names.add(parsed.third.lowercase(Locale.ROOT))
+      remoteKept.add(line)
+    }
+
+    val ordered = ArrayList<String>(remoteKept.size + localKept.size)
+    ordered.addAll(remoteKept)
+    ordered.addAll(localKept)
+
+    val lastPrimary = ordered.indexOfLast {
+      parseWallpaperLine(it)?.second == ProxyContract.WALLPAPER_TARGET_PRIMARY
+    }
+    val collapsed = ArrayList<String>(ordered.size)
+    for ((index, line) in ordered.withIndex()) {
+      val target = parseWallpaperLine(line)?.second
+      if (target == ProxyContract.WALLPAPER_TARGET_PRIMARY && index != lastPrimary) continue
+      collapsed.add(line)
+    }
+
+    if (collapsed.size <= ProxyContract.MAX_WALLPAPERS) return collapsed
+    return collapsed.subList(collapsed.size - ProxyContract.MAX_WALLPAPERS, collapsed.size).toList()
+  }
+
+  /**
+   * `{id} {bytes} {target} {filename}` to (id, target, filename), or null when the line is not one.
+   *
+   * The filename component comes back as '' for a primary — the wire carries '-' there, which means
+   * "no name" — so a caller can test emptiness without knowing the placeholder.
+   */
+  private fun parseWallpaperLine(line: String): Triple<String, String, String>? {
+    val firstSpace = line.indexOf(' ')
+    if (firstSpace <= 0) return null
+    val secondSpace = line.indexOf(' ', firstSpace + 1)
+    if (secondSpace <= firstSpace + 1) return null
+    val thirdSpace = line.indexOf(' ', secondSpace + 1)
+    if (thirdSpace <= secondSpace + 1) return null
+
+    val id = line.substring(0, firstSpace)
+    val bytes = line.substring(firstSpace + 1, secondSpace)
+    val target = line.substring(secondSpace + 1, thirdSpace)
+    val filename = line.substring(thirdSpace + 1)
+
+    if (!LocalOutbox.isValidId(id)) return null
+    if (bytes.isEmpty() || bytes.any { !it.isDigit() }) return null
+    return when (target) {
+      ProxyContract.WALLPAPER_TARGET_PRIMARY -> {
+        // A primary carries NO name, so anything but the placeholder is a line this process cannot
+        // describe honestly and is dropped rather than half interpreted.
+        if (filename != ProxyContract.WALLPAPER_NO_FILENAME) null
+        else Triple(id, target, "")
+      }
+      ProxyContract.WALLPAPER_TARGET_SET -> {
+        if (!LocalOutbox.isValidWallpaperFilename(filename)) null
+        else Triple(id, target, filename)
+      }
+      else -> null
+    }
   }
 
   /** The headers `mailbox/src/core.js` puts on every answer, so the two servers look the same. */

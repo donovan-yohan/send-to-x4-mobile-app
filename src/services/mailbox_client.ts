@@ -64,6 +64,49 @@
  * books. The server keeps at most 20 books per box and evicts the OLDEST beyond
  * that (`MAX_BOOKS`), so a mailbox is a delivery queue, not storage.
  *
+ * ---------------------------------------------------------------------------
+ * WALLPAPERS RIDE IT TOO — SAME URL, SAME TOKEN, SAME ARGUMENT
+ * ---------------------------------------------------------------------------
+ * A sleep screen used to be direct-LAN ONLY: `wallpaper_sender.sendWallpaperBmp`
+ * pushes a BMP at the reader's own HTTP/WS API, which needs the reader AWAKE and
+ * on this network. That made "change what my partner's reader shows while it
+ * sleeps" the one thing a client phone could never do and a host could only do
+ * in the seconds the reader happens to be up. The mailbox removes both limits:
+ * the picture waits in the box and the reader collects it on its own sync
+ * window, exactly as a note or a book does.
+ *
+ *   FIRMWARE READS (no auth, same capability URL):
+ *     GET  {base}/wallpaper.txt   -> 200 text/plain,
+ *                                    `{id} {bytes} {target} {filename}\n` per
+ *                                    pending item, NEWEST LAST, so a reader that
+ *                                    applies the lines IN ORDER finishes on the
+ *                                    newest primary. `{filename}` is '-' for a
+ *                                    primary. EMPTY body = nothing waiting.
+ *     GET  {base}/wallpaper/{id}  -> 200 image/bmp, `Range` honoured (206/416)
+ *                                    exactly as `books/{id}` is.
+ *
+ *   APP WRITES (bearer auth — this module):
+ *     POST   {base}/wallpaper     Content-Type: application/octet-stream
+ *                                 X-Wallpaper-Id: <id>
+ *                                 X-Wallpaper-Target: primary | set
+ *                                 X-Filename: <name.bmp>   (target=set ONLY)
+ *                                 body = the BMP, 1..MAX_WALLPAPER_BYTES
+ *                                 200 {"ok":true,"id","target","filename","bytes"}
+ *                                 | 401 | 400 | 413
+ *     DELETE {base}/wallpaper/{id} -> 200 {"ok":true,...} | 404
+ *
+ * READER-SIDE APPLICATION, and it is why `target` is on the wire rather than
+ * inferred from the name: 'primary' lands at `/sleep.bmp` (the single top-
+ * priority slot) and 'set' lands at `/.sleep/<filename>` (the rotation). Those
+ * are two different files with two different meanings, and a reader that had to
+ * guess would put a "pin this one picture" into the random rotation.
+ *
+ * RETENTION IS NOT THE BOOKS' RULE. The server keeps at most
+ * {@link MAILBOX_MAX_WALLPAPERS} and evicts oldest-first like books, but a NEW
+ * 'primary' also SUPERSEDES any earlier undelivered 'primary' — there is exactly
+ * one `/sleep.bmp` on the card, so a queue holding three of them would spend
+ * three sync windows' worth of radio to end up where one would have.
+ *
  * THE READ SIDE HAS NO AUTHENTICATION. The firmware's HTTP client sends no
  * headers on reads (and accepts any TLS cert via `setInsecure`), so the ONLY
  * thing protecting a mailbox is that `{base}` is unguessable. Two consequences
@@ -206,6 +249,74 @@ export const BOOK_ID_MAX_CHARS = 64;
 const BOOK_ID_ALLOWED = /^[A-Za-z0-9._~-]+$/;
 
 /**
+ * Wallpapers. `POST {base}/wallpaper` writes one; `DELETE {base}/wallpaper/{id}`
+ * removes one. {@link MAILBOX_WALLPAPER_MANIFEST_PATH} is the FIRMWARE's read
+ * suffix and is here for documentation only — nothing in this module fetches it,
+ * for the same three reasons {@link listMailboxWallpapers} spells out.
+ */
+export const MAILBOX_WALLPAPER_PATH = '/wallpaper';
+export const MAILBOX_WALLPAPER_MANIFEST_PATH = '/wallpaper.txt';
+
+/**
+ * Hard ceiling on one wallpaper, in bytes.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS IS A MIRROR OF `mailbox/src/core.js` `MAX_WALLPAPER_BYTES` (4 MiB).
+ * ---------------------------------------------------------------------------
+ * Same rule and same enforcement as {@link MAILBOX_MAX_BOOK_BYTES}: the value
+ * cannot be imported (core.js is outside tsconfig's roots and outside Metro's
+ * bundle), so it is re-typed and the two literals are pinned equal by a test
+ * that reads BOTH FILES (`scripts/mailbox-client.test.js`, "mirrors
+ * mailbox/src/core.js").
+ *
+ * 4 MiB is deliberately generous rather than tight. The sleep screen is
+ * 528x792 8-bit, i.e. ~419 KB of pixels, and the largest thing this app would
+ * ever encode — a 1056-long-side 8bpp BMP — is ~1.1 MB. Four MiB leaves room
+ * for a picture put in the box by something other than this app while staying
+ * far under Workers KV's 25 MiB single-value ceiling, so the cap that bites is
+ * always this one and never the platform's.
+ */
+export const MAILBOX_MAX_WALLPAPER_BYTES = 4 * 1024 * 1024; // 4194304
+
+/**
+ * Longest `X-Filename` the wallpaper route accepts.
+ *
+ * MIRROR of `mailbox/src/core.js` `WALLPAPER_FILENAME_MAX_LEN`, pinned by the
+ * same two-file test. The same 120 as books, and for the same reason: the name
+ * becomes a file on the reader's SD card, and truncating it would drop the
+ * `.bmp` the firmware scans `/.sleep` for.
+ */
+export const MAILBOX_WALLPAPER_FILENAME_MAX_CHARS = 120;
+
+/**
+ * How many wallpapers a box holds before the OLDEST is evicted.
+ *
+ * MIRROR of `mailbox/src/core.js` `MAX_WALLPAPERS`. Smaller than `MAX_BOOKS`
+ * (20) on purpose: the rotation set is a handful of pictures a user curates, not
+ * a library, and every extra entry is a whole BMP the reader has to pull inside
+ * its battery-budgeted wake windows before it gets to the newest one.
+ */
+export const MAILBOX_MAX_WALLPAPERS = 8;
+
+/** Longest wallpaper id the server accepts (`WALLPAPER_ID_MAX_LEN` in core.js). */
+export const WALLPAPER_ID_MAX_CHARS = 64;
+
+/**
+ * Charset a wallpaper id may use: `WALLPAPER_ID_PATTERN` in core.js, which is
+ * `BOOK_ID_PATTERN`, which is `NOTE_ID_PATTERN`. Declared as its own binding
+ * rather than reusing {@link BOOK_ID_ALLOWED} so the two can be told apart if
+ * the server ever narrows one of them.
+ */
+const WALLPAPER_ID_ALLOWED = /^[A-Za-z0-9._~-]+$/;
+
+/** Extension the firmware scans `/.sleep` for. Lowercase on the wire. */
+const WALLPAPER_EXTENSION = '.bmp';
+
+/** BMP file magic ('BM') — the cheapest guard against a mis-routed payload. */
+const BMP_MAGIC_B = 0x42;
+const BMP_MAGIC_M = 0x4d;
+
+/**
  * Publish budget. A 52 KB body on a phone radio is quick, but a captive portal
  * or a dead tunnel can hang a fetch indefinitely, and the user is staring at a
  * spinner the whole time.
@@ -227,6 +338,14 @@ const STATUS_TIMEOUT_MS = 10000;
 
 /** A delete is a manifest edit plus a blob drop; it moves no user bytes. */
 const BOOK_DELETE_TIMEOUT_MS = 20000;
+
+/**
+ * Wallpaper budget. Between the two: a BMP is ~1 MB rather than a book's tens,
+ * but two orders of magnitude past a 52 KB frame, and the user is watching a
+ * spinner either way. Bounded for the same reason every other budget here is,
+ * and safe to retry — re-POSTing the same id overwrites.
+ */
+const WALLPAPER_PUBLISH_TIMEOUT_MS = 60000;
 
 // ---------------------------------------------------------------------------
 // Result shapes
@@ -304,6 +423,59 @@ export interface MailboxBooksResult {
     error?: string;
     /** Newest first, exactly as the server orders it. `[]` on an empty box. */
     books: MailboxBook[];
+    /** HTTP status, when the request reached the server. */
+    httpStatus?: number;
+}
+
+/**
+ * Which sleep-screen slot a published wallpaper is aimed at.
+ *
+ * ON THE WIRE as `X-Wallpaper-Target` and as the third field of a
+ * `wallpaper.txt` line, because the reader cannot infer it: 'primary' is the
+ * single `/sleep.bmp` slot the firmware prefers over everything, 'set' is one
+ * entry of the `/.sleep` rotation it picks from at random. A wallpaper that
+ * arrived without this would have to be guessed into one of them, and the guess
+ * is user-visible either way round.
+ *
+ * The strings are the SAME two words `wallpaper_sender.WallpaperTarget` uses for
+ * the direct route, so one send can carry one target through both roads.
+ */
+export type MailboxWallpaperTarget = 'primary' | 'set';
+
+/**
+ * One wallpaper the mailbox is holding, as `/status` reports it.
+ *
+ * `filename` is '' for a primary — the slot is fixed (`/sleep.bmp`), so there is
+ * no name to carry, and the manifest line writes '-' in that position purely so
+ * the line keeps four space-separated fields for a C-string walk.
+ */
+export interface MailboxWallpaper {
+    id: string;
+    target: MailboxWallpaperTarget;
+    /** '' for a primary; a `*.bmp` name for a rotation entry. */
+    filename: string;
+    bytes: number;
+}
+
+/** `UploadResult` plus what the server stored, for one wallpaper. */
+export interface MailboxWallpaperResult extends UploadResult {
+    /** Set on success; also set on a REJECTED publish, so a retry can reuse it. */
+    id?: string;
+    /** Echoed back by the server; the value it will publish. */
+    target?: MailboxWallpaperTarget;
+    /** The filename the server stored, which may differ from the one sent. */
+    filename?: string;
+    /** Bytes the server reported storing. */
+    bytes?: number;
+    /** HTTP status, when the request reached the server. */
+    status?: number;
+}
+
+export interface MailboxWallpapersResult {
+    success: boolean;
+    error?: string;
+    /** Exactly as the server orders it. `[]` on a box holding none. */
+    wallpapers: MailboxWallpaper[];
     /** HTTP status, when the request reached the server. */
     httpStatus?: number;
 }
@@ -393,6 +565,31 @@ export function mintBookId(): string {
 }
 
 /**
+ * Prefix that marks an id as a WALLPAPER id.
+ *
+ * Same argument as {@link BOOK_ID_PREFIX}: notes, books and wallpapers share one
+ * box, one charset and one set of server logs, so the id alone has to answer
+ * "which thing is this?" when something is traced by hand. Inside `[a-z0-9-]`,
+ * so it cannot push the id outside {@link WALLPAPER_ID_ALLOWED}.
+ */
+export const WALLPAPER_ID_PREFIX = 'wp-';
+
+/**
+ * Mint an id for one published wallpaper.
+ *
+ * REUSES {@link mintNoteId} for the reason {@link mintBookId} does — the
+ * uniqueness argument must not be able to drift between three call sites — and a
+ * duplicate here is worse than a duplicate book: re-POSTing an id OVERWRITES,
+ * and two wallpapers sharing one id means the first picture the user chose is
+ * silently replaced by the second while both appear to have been sent.
+ *
+ * @returns 24 chars matching /^wp-[0-9a-z]{9}-[0-9a-z]{11}$/.
+ */
+export function mintWallpaperId(): string {
+    return `${WALLPAPER_ID_PREFIX}${mintNoteId()}`;
+}
+
+/**
  * Why `id` cannot be used as a book id, or null when it can.
  *
  * Mirrors `core.js` `validateBookId`, INCLUDING the dot-only reject: `..`
@@ -443,6 +640,66 @@ function describeBookFilenameProblem(filename: string): string | null {
     // are traversal. Both are one rule, on both sides.
     if (filename.startsWith('.')) return 'Book filename must not start with ".".';
     if (!/\.epub$/i.test(filename)) return 'Book filename must end in .epub.';
+    return null;
+}
+
+/**
+ * Why `id` cannot be used as a wallpaper id, or null when it can.
+ *
+ * Mirrors `core.js` `validateWallpaperId`, dot-only reject included, for the
+ * reason {@link describeBookIdProblem} spells out: the id is echoed verbatim
+ * into a `wallpaper.txt` line, becomes a URL path segment and becomes a store
+ * key (a FILE PATH on the dev server).
+ */
+function describeWallpaperIdProblem(id: string): string | null {
+    if (!id) return 'Wallpaper id is empty.';
+    if (id.length > WALLPAPER_ID_MAX_CHARS) {
+        return `Wallpaper id is ${id.length} characters; the mailbox accepts ${WALLPAPER_ID_MAX_CHARS}.`;
+    }
+    if (!WALLPAPER_ID_ALLOWED.test(id)) {
+        return `Wallpaper id must match [A-Za-z0-9._~-] (got "${id}").`;
+    }
+    if (/^\.+$/.test(id)) return '"." and ".." are not wallpaper ids.';
+    return null;
+}
+
+/**
+ * Why `filename` cannot be sent as `X-Filename` on the wallpaper route, or null
+ * when it can.
+ *
+ * REJECT-ONLY, exactly like {@link describeBookFilenameProblem}: the server both
+ * rejects and tidies, and only the rejects are mirrored here, because
+ * `wallpaper_sender.sanitizeSleepSetName` is the ONE place in the app that
+ * decides what a rotation entry is called and a second normaliser would disagree
+ * with it about which file the user just added.
+ *
+ * THE SPACE RULE IS THE ONE THAT IS NOT SHARED WITH BOOKS. A `books.txt` line
+ * puts the filename LAST, so a space in it is harmless; a `wallpaper.txt` line
+ * is `{id} {bytes} {target} {filename}` and the filename is still last — but the
+ * '-' placeholder a primary uses means a name that IS '-' would be
+ * indistinguishable from "no name". Refused here rather than papered over.
+ */
+function describeWallpaperFilenameProblem(filename: string): string | null {
+    if (!filename) return 'Wallpaper filename is empty.';
+    if (filename.length > MAILBOX_WALLPAPER_FILENAME_MAX_CHARS) {
+        return (
+            `Wallpaper filename is ${filename.length} characters; the mailbox accepts ` +
+            `${MAILBOX_WALLPAPER_FILENAME_MAX_CHARS}.`
+        );
+    }
+    if (/[/\\]/.test(filename)) return 'Wallpaper filename must be a bare name, not a path.';
+    // An internal CR/LF would forge an extra `wallpaper.txt` line; the rest have
+    // no business in a name written to an SD card. Written with \u escapes so
+    // this source stays plain ASCII, as in `epub_sender`'s CONTROL_CHARS.
+    if (/[\u0000-\u001f\u007f]/.test(filename)) {
+        return 'Wallpaper filename must not contain control characters.';
+    }
+    // A dot-leading name is invisible in the reader's own file browser, and
+    // '.'/'..' are traversal. `/.sleep` is ALREADY a hidden folder; a hidden file
+    // inside it is a picture nobody can find to delete.
+    if (filename.startsWith('.')) return 'Wallpaper filename must not start with ".".';
+    if (filename === '-') return 'Wallpaper filename must not be "-" (that means "no name").';
+    if (!/\.bmp$/i.test(filename)) return `Wallpaper filename must end in ${WALLPAPER_EXTENSION}.`;
     return null;
 }
 
@@ -1354,6 +1611,440 @@ function parseMailboxBooks(body: string): MailboxBook[] | null {
         books.push({ id, filename, bytes });
     }
     return books;
+}
+
+// ---------------------------------------------------------------------------
+// Wallpapers
+// ---------------------------------------------------------------------------
+
+/**
+ * Publish one 8-bit grayscale BMP to the mailbox as a pending sleep screen.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT "SUCCESS" MEANS HERE (and it is not "the panel changed")
+ * ---------------------------------------------------------------------------
+ * A 200 means THE PICTURE IS IN THE MAILBOX. The reader fetches
+ * `wallpaper.txt` inside a wake window, pulls what it has not applied yet, and
+ * writes it to `/sleep.bmp` or `/.sleep/<filename>`. So the honest sentence for
+ * a user after this returns is "it will land on the reader next sync" — the
+ * same promise `publishBook` makes, and for the same reason.
+ *
+ * AND EVEN THEN THE PANEL MAY NOT CHANGE: the reader only shows a custom sleep
+ * screen when its own Sleep Screen setting is 'Custom', which is an ON-DEVICE
+ * toggle with no remote equivalent. `wallpaper_sender.SLEEP_MODE_HINT` is the
+ * one canonical wording for that; this route does not change the fact.
+ *
+ * THE 'BM' MAGIC IS CHECKED BEFORE THE UPLOAD. Not paranoia: the direct route
+ * checks it too (`sendWallpaperBmp`), and the failure it catches — a love-note
+ * frame handed to a wallpaper call — would otherwise be a file the firmware
+ * tries and fails to decode on every single sleep, with a cheerful "sent" in
+ * the app. A guard the two roads share cannot disagree about what a wallpaper is.
+ *
+ * RE-POSTING THE SAME ID OVERWRITES, which is what makes a retry after a
+ * timeout safe. Mint a NEW id ({@link mintWallpaperId}) for DIFFERENT content: a
+ * reader mid-resume compares the size it read from `wallpaper.txt` against every
+ * `Content-Range` and has to restart when they disagree.
+ *
+ * `onProgress` is COARSE — 0 on entry, 100 on success. `fetch` exposes no upload
+ * progress in React Native and a fake ramp is a lie the user acts on.
+ *
+ * NEVER THROWS.
+ *
+ * @param mailboxUrl   `{base}` — the same string the reader stores.
+ * @param writeToken   Bearer token. NEVER put this in the URL.
+ * @param bmp          The whole BMP. Encoding is the CALLER's job, so this
+ *                     module keeps its zero dependency on expo/react-native.
+ * @param target       'primary' for `/sleep.bmp`, 'set' for the rotation.
+ * @param filename     REQUIRED for 'set', IGNORED for 'primary' (the slot is
+ *                     fixed, so a name would be a value the reader must discard).
+ * @param wallpaperId  Optional; minted when absent. Supply it only to RETRY.
+ */
+export async function publishWallpaper(
+    mailboxUrl: string,
+    writeToken: string,
+    bmp: Uint8Array,
+    target: MailboxWallpaperTarget,
+    filename?: string,
+    wallpaperId?: string,
+    onProgress?: (percent: number) => void
+): Promise<MailboxWallpaperResult> {
+    if (target !== 'primary' && target !== 'set') {
+        return {
+            success: false,
+            error: `Unknown wallpaper target ${JSON.stringify(target)} (expected 'primary' or 'set').`,
+        };
+    }
+
+    const byteLength = bmp ? bmp.byteLength : 0;
+    if (!bmp || byteLength === 0) {
+        return { success: false, error: 'Wallpaper is empty (0 bytes) — nothing to send.' };
+    }
+    if (bmp[0] !== BMP_MAGIC_B || bmp[1] !== BMP_MAGIC_M) {
+        return {
+            success: false,
+            error:
+                'Wallpaper payload is not a BMP (expected a "BM" header from prepareWallpaperBmp).',
+        };
+    }
+    if (byteLength > MAILBOX_MAX_WALLPAPER_BYTES) {
+        return {
+            success: false,
+            error:
+                `Wallpaper is ${formatMib(byteLength)}; the mailbox accepts up to ` +
+                `${formatMib(MAILBOX_MAX_WALLPAPER_BYTES)}.`,
+        };
+    }
+
+    // 'primary' carries NO name. Dropping it here rather than sending it and
+    // letting the server ignore it keeps one rule in one place: what the app
+    // puts on the wire is exactly what the server will act on.
+    const name = target === 'set' ? (typeof filename === 'string' ? filename.trim() : '') : '';
+    if (target === 'set') {
+        const nameProblem = describeWallpaperFilenameProblem(name);
+        if (nameProblem !== null) return { success: false, error: nameProblem };
+    }
+
+    const urlProblem = describeMailboxUrlProblem(mailboxUrl);
+    if (urlProblem !== null) return { success: false, error: urlProblem };
+
+    const token = typeof writeToken === 'string' ? writeToken.trim() : '';
+    if (!token) return { success: false, error: 'Mailbox write token is not set.' };
+
+    const id =
+        typeof wallpaperId === 'string' && wallpaperId.trim() ? wallpaperId.trim() : mintWallpaperId();
+    const idProblem = describeWallpaperIdProblem(id);
+    if (idProblem !== null) return { success: false, error: idProblem };
+
+    const base = checkMailboxBaseUrl(mailboxUrl).url;
+    const endpoint = mailboxEndpoint(base, MAILBOX_WALLPAPER_PATH);
+
+    const doFetch = getFetch();
+    if (!doFetch) return { success: false, error: NO_FETCH_ERROR, id, target };
+
+    onProgress?.(0);
+
+    // A plain ArrayBuffer rather than the view, for the reason publishLoveNote
+    // and publishBook both do it: the copy guarantees the request cannot carry
+    // bytes outside `bmp`'s window when a caller hands over a subarray.
+    const body = bmp.buffer.slice(bmp.byteOffset, bmp.byteOffset + byteLength) as ArrayBuffer;
+
+    const headers: Record<string, string> = {
+        ...authHeaders(token),
+        'Content-Type': 'application/octet-stream',
+        'X-Wallpaper-Id': id,
+        'X-Wallpaper-Target': target,
+    };
+    if (target === 'set') headers['X-Filename'] = name;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), WALLPAPER_PUBLISH_TIMEOUT_MS);
+    try {
+        const response = await doFetch(endpoint, {
+            method: 'POST',
+            headers,
+            body,
+            signal: controller.signal,
+        });
+
+        const status = response.status;
+        const text = await readBodyText(response);
+
+        if (status >= 200 && status < 300) {
+            // Trust the SERVER's echo over ours, exactly as publishBook does:
+            // `X-Filename` is sanitized server-side (FAT punctuation and
+            // non-ASCII are REPLACED, not rejected), so the name the reader will
+            // create can legitimately differ from the one sent.
+            const echoed = parseWallpaperFromBody(text);
+            onProgress?.(100);
+            return {
+                success: true,
+                id: echoed.id || id,
+                target: echoed.target ?? target,
+                filename: echoed.filename ?? name,
+                bytes: echoed.bytes ?? byteLength,
+                status,
+            };
+        }
+
+        return {
+            success: false,
+            error: describeWallpaperPublishStatus(status, text, base),
+            id,
+            target,
+            filename: name,
+            status,
+        };
+    } catch (error) {
+        return {
+            success: false,
+            error: describeNetworkFailure(error, endpoint),
+            id,
+            target,
+            filename: name,
+        };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * List the wallpapers the mailbox is holding.
+ *
+ * READS `/status`, NOT `/wallpaper.txt`, for the three reasons
+ * {@link listMailboxBooks} sets out and which apply here verbatim: the text
+ * manifest is the FIRMWARE's byte-exact contract and the app must not become a
+ * second consumer of it; it has NO AUTH, so a listing that worked with a broken
+ * write token would show a healthy queue on a box this phone cannot publish to;
+ * and one authenticated request already carries the note pointer, the books and
+ * the wallpapers together.
+ *
+ * ORDER IS THE SERVER'S, AND `/status` IS NEWEST FIRST — the same order
+ * {@link listMailboxBooks} returns, because both read the STORED index, which
+ * core.js keeps newest-first for books and wallpapers alike (publish does
+ * `[entry, ...kept]`).
+ *
+ * DO NOT CONFUSE THIS WITH `wallpaper.txt`, WHICH IS NEWEST LAST. That reversal
+ * is applied inside `renderWallpaperManifest` and NOWHERE ELSE: it exists
+ * because a reader APPLIES the lines in order and the last primary written wins
+ * `/sleep.bmp`, so the firmware's wire has to end on the newest. Nothing about
+ * that ordering reaches this function — `/status` is JSON for a human-facing
+ * list, not a sequence anyone applies. A UI that wants newest-first (they all
+ * do) renders this array as it arrives; reversing it yields OLDEST first.
+ *
+ * NEVER THROWS.
+ */
+export async function listMailboxWallpapers(
+    mailboxUrl: string,
+    writeToken: string
+): Promise<MailboxWallpapersResult> {
+    const fetched = await fetchStatusBody(mailboxUrl, writeToken);
+    if (!fetched.success) {
+        return {
+            success: false,
+            error: fetched.error,
+            wallpapers: [],
+            httpStatus: fetched.httpStatus,
+        };
+    }
+
+    const body = fetched.body ?? '';
+    const wallpapers = parseMailboxWallpapers(body);
+    if (!wallpapers) {
+        return {
+            success: false,
+            error: `Mailbox status was not readable JSON.${body ? ` (${bodySnippet(body)})` : ''}`,
+            wallpapers: [],
+            httpStatus: fetched.httpStatus,
+        };
+    }
+    return { success: true, wallpapers, httpStatus: fetched.httpStatus };
+}
+
+/**
+ * Remove one wallpaper from the mailbox.
+ *
+ * WHAT THIS DOES AND DOES NOT DO, same as {@link deleteMailboxBook}: it stops
+ * the picture being ADVERTISED, so a reader that has not applied it yet never
+ * will. A reader that already wrote it to the card KEEPS it — reader-side state
+ * is authoritative and there is no reverse channel, so removing `/sleep.bmp`
+ * from the card is the direct route's job (`deleteSleepSetEntry`, or a new
+ * primary that replaces it). Saying otherwise in the UI would be a promise this
+ * contract cannot keep.
+ *
+ * NEVER THROWS.
+ */
+export async function deleteMailboxWallpaper(
+    mailboxUrl: string,
+    writeToken: string,
+    wallpaperId: string
+): Promise<MailboxWallpaperResult> {
+    const id = typeof wallpaperId === 'string' ? wallpaperId.trim() : '';
+    const idProblem = describeWallpaperIdProblem(id);
+    if (idProblem !== null) return { success: false, error: idProblem };
+
+    const urlProblem = describeMailboxUrlProblem(mailboxUrl);
+    if (urlProblem !== null) return { success: false, error: urlProblem, id };
+
+    const token = typeof writeToken === 'string' ? writeToken.trim() : '';
+    if (!token) return { success: false, error: 'Mailbox write token is not set.', id };
+
+    const base = checkMailboxBaseUrl(mailboxUrl).url;
+    // Charset-restricted to [A-Za-z0-9._~-] above, so no escaping is needed —
+    // and MUST NOT be applied: the server compares the raw path segment.
+    const endpoint = mailboxEndpoint(base, `${MAILBOX_WALLPAPER_PATH}/${id}`);
+
+    const doFetch = getFetch();
+    if (!doFetch) return { success: false, error: NO_FETCH_ERROR, id };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), BOOK_DELETE_TIMEOUT_MS);
+    try {
+        const response = await doFetch(endpoint, {
+            method: 'DELETE',
+            headers: { ...authHeaders(token), Accept: 'application/json' },
+            signal: controller.signal,
+        });
+
+        const status = response.status;
+        const text = await readBodyText(response);
+
+        if (status >= 200 && status < 300) {
+            const echoed = parseWallpaperFromBody(text);
+            return {
+                success: true,
+                id: echoed.id || id,
+                target: echoed.target,
+                filename: echoed.filename,
+                status,
+            };
+        }
+        if (status === 404) {
+            return {
+                success: false,
+                error: `The mailbox has no wallpaper with id "${id}" (404). Refresh the list.`,
+                id,
+                status,
+            };
+        }
+        return {
+            success: false,
+            error: describeWallpaperPublishStatus(status, text, base),
+            id,
+            status,
+        };
+    } catch (error) {
+        return { success: false, error: describeNetworkFailure(error, endpoint), id };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * Turn a wallpaper route's HTTP status into something the user can act on.
+ *
+ * Separate from {@link describeBookPublishStatus} because the SAME codes name
+ * different limits: a 413 here is a picture over 4 MiB, not a book over 24.
+ */
+function describeWallpaperPublishStatus(status: number, body: string, base: string): string {
+    const snippet = bodySnippet(body);
+    const detail = snippet ? ` (${snippet})` : '';
+
+    if (status === 401 || status === 403) {
+        return `Mailbox token rejected (${status}). Check the mailbox write token in Settings.${detail}`;
+    }
+    if (status === 404) {
+        return `Mailbox not found at ${base} (404). Check the mailbox URL in Settings.${detail}`;
+    }
+    if (status === 413) {
+        return (
+            `Mailbox rejected the wallpaper (413): it is over the ` +
+            `${formatMib(MAILBOX_MAX_WALLPAPER_BYTES)} limit.${detail}`
+        );
+    }
+    if (status === 400) {
+        return `Mailbox rejected the wallpaper (400): bad id, target, filename or empty body.${detail}`;
+    }
+    if (status === 429) {
+        return `Mailbox is rate-limiting (429). Wait a moment and send again.${detail}`;
+    }
+    if (status >= 500) {
+        return `Mailbox server error (${status}). Try again in a moment.${detail}`;
+    }
+    return `Mailbox rejected the wallpaper (${status}).${detail}`;
+}
+
+/** Coerce an unknown into a wallpaper target, or undefined. */
+function asWallpaperTarget(value: unknown): MailboxWallpaperTarget | undefined {
+    return value === 'primary' || value === 'set' ? value : undefined;
+}
+
+/**
+ * Pull `{id, target, filename, bytes}` out of a wallpaper route's JSON body.
+ *
+ * Every field is optional in the return for the reason `parseBookFromBody` gives:
+ * a 200 whose body did not parse still means the write HAPPENED, so the caller
+ * falls back to what it sent rather than reporting a failure that would have the
+ * user upload the same picture twice.
+ */
+function parseWallpaperFromBody(body: string): {
+    id?: string;
+    target?: MailboxWallpaperTarget;
+    filename?: string;
+    bytes?: number;
+} {
+    if (!body) return {};
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return {};
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const raw = parsed as { id?: unknown; target?: unknown; filename?: unknown; bytes?: unknown };
+    const out: { id?: string; target?: MailboxWallpaperTarget; filename?: string; bytes?: number } =
+        {};
+    if (typeof raw.id === 'string' && raw.id.trim()) out.id = raw.id.trim();
+    const target = asWallpaperTarget(raw.target);
+    if (target) out.target = target;
+    // '' is a MEANINGFUL echo for a primary ("no name"), so an empty string is
+    // kept rather than falling back to what was sent.
+    if (typeof raw.filename === 'string') out.filename = raw.filename.trim();
+    if (typeof raw.bytes === 'number' && Number.isFinite(raw.bytes) && raw.bytes >= 0) {
+        out.bytes = raw.bytes;
+    }
+    return out;
+}
+
+/**
+ * Decode the `wallpapers` array out of a `/status` body.
+ *
+ * `[]` and a MISSING key are both "none waiting" — a box that has only ever held
+ * notes answers without the key at all. `null` is returned ONLY when the body is
+ * not JSON, so a caller can tell "the queue is empty" from "that was not a
+ * mailbox".
+ *
+ * Entries are validated, not trusted. An entry with no id, or with a target
+ * that is neither word, is DROPPED: the id is the handle every subsequent action
+ * needs, and a row whose target cannot be read cannot be described to the user
+ * ("pinned" versus "in the rotation" is the whole difference between the two).
+ * A 'set' row with no filename is dropped for the same reason — that name IS the
+ * file the reader will create.
+ */
+function parseMailboxWallpapers(body: string): MailboxWallpaper[] | null {
+    if (!body.trim()) return null;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return null;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+    const raw = (parsed as { wallpapers?: unknown }).wallpapers;
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) return [];
+
+    const wallpapers: MailboxWallpaper[] = [];
+    for (const entry of raw) {
+        if (!entry || typeof entry !== 'object') continue;
+        const row = entry as {
+            id?: unknown;
+            target?: unknown;
+            filename?: unknown;
+            bytes?: unknown;
+        };
+        const id = typeof row.id === 'string' ? row.id.trim() : '';
+        const target = asWallpaperTarget(row.target);
+        if (!id || !target) continue;
+        const filename = typeof row.filename === 'string' ? row.filename.trim() : '';
+        if (target === 'set' && !filename) continue;
+        const bytes =
+            typeof row.bytes === 'number' && Number.isFinite(row.bytes) && row.bytes >= 0
+                ? row.bytes
+                : 0;
+        wallpapers.push({ id, target, filename: target === 'primary' ? '' : filename, bytes });
+    }
+    return wallpapers;
 }
 
 /** Accept an epoch number or an ISO string; anything else becomes null. */

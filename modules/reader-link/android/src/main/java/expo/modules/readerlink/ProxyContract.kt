@@ -152,6 +152,34 @@ object ProxyContract {
   const val BOOK_PATH_MARKER = "/books/"
 
   /**
+   * The wallpaper pair, added when the sleep screen stopped being direct LAN only.
+   *
+   * ORDER OF MATCHING MATTERS and is enforced in [MailboxPaths.classify]: a request for
+   * `/wallpaper.txt` must be classified as the MANIFEST, never as a body whose id happens to be
+   * "wallpaper.txt". The suffix test runs first and the two cannot collide anyway (a path ending
+   * `/wallpaper.txt` contains no `/wallpaper/`), but the order is written down because reversing it
+   * would produce a 404 for the one endpoint the reader polls every window.
+   */
+  const val WALLPAPER_SUFFIX = "/wallpaper.txt"
+  const val WALLPAPER_PATH_MARKER = "/wallpaper/"
+
+  /** What a wallpaper body is served as. Section 2 uses the same type. */
+  const val WALLPAPER_CONTENT_TYPE = "image/bmp"
+
+  /** The two slots, as they appear in the third field of a `wallpaper.txt` line. */
+  const val WALLPAPER_TARGET_PRIMARY = "primary"
+  const val WALLPAPER_TARGET_SET = "set"
+
+  /**
+   * The filename field of a `wallpaper.txt` line for a PRIMARY.
+   *
+   * A line is `{id} {bytes} {target} {filename}` and the filename is the rest of the line, so a
+   * primary still has to put SOMETHING there or a C string walk loses its field count. '-' is that
+   * something, which is why a rotation entry literally named '-' is refused by both halves.
+   */
+  const val WALLPAPER_NO_FILENAME = "-"
+
+  /**
    * Content types, matching `core.js` exactly. [HEALTH_CONTENT_TYPE] carries the same string as
    * [TEXT_CONTENT_TYPE] and stays a separate literal on purpose: it is pinned to the A3 canonical
    * wire block by scripts/reader-link-contract.test.js, so it must not become a reference to
@@ -176,6 +204,17 @@ object ProxyContract {
   const val MAX_BOOKS = 20
   const val BOOK_ID_MAX_LEN = 64
   const val BOOK_FILENAME_MAX_LEN = 120
+
+  /**
+   * Section 2's wallpaper caps. 4 MiB rather than the book's 24: the sleep screen is 528x792 8 bit,
+   * so a BMP is about 419 KB and the largest thing the app encodes is about 1.1 MB. A body past this
+   * cap is a mis routed payload rather than a wallpaper, and serving it would spend a whole wake
+   * window on bytes the firmware then discards.
+   */
+  const val MAX_WALLPAPER_BYTES = 4L * 1024L * 1024L
+  const val MAX_WALLPAPERS = 8
+  const val WALLPAPER_ID_MAX_LEN = 64
+  const val WALLPAPER_FILENAME_MAX_LEN = 120
 
   /**
    * The manifest is an index, never a body: 20 books at section 2's caps is under 4 KB of

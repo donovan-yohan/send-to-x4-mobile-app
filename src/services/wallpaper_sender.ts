@@ -64,12 +64,40 @@
  * naming, path mapping and result shaping are all covered under node while the
  * app still gets a plain static dependency through Metro.
  *
+ * ---------------------------------------------------------------------------
+ * THREE ROADS NOW, NOT ONE — SEE {@link routeWallpaperSend}
+ * ---------------------------------------------------------------------------
+ * Everything above describes the DIRECT road, which is all this module had for a
+ * long time and is why WallpaperScreen was the last screen in the app that went
+ * grey whenever the reader was asleep. {@link routeWallpaperSend} is the entry
+ * point callers should use: it tries the reader first (when there is any point),
+ * falls back to the mailbox the reader already polls, and parks a copy in the
+ * outbox for a peer-link handover when neither worked. `sendWallpaperBmp` stays
+ * exported and unchanged — it is the direct leg, and `promote.ts` and the
+ * router both call it.
+ *
  * NEVER THROWS. Every entry point reports failure in its return value
  * (`UploadResult` / `[]` / `false`), matching `sendLoveNoteFrame` and
  * `sendNoteAsTxt`. Callers written to the repo convention need no try/catch.
  */
 
-import type { UploadResult } from '../types';
+import type { Role, UploadResult } from '../types';
+import { isMailboxConfigured, MAILBOX_SETUP_HINT, isDeviceUnreachableError } from './love_note_sender';
+import {
+    describeMailboxUrlProblem,
+    mintWallpaperId,
+    publishWallpaper,
+    type MailboxWallpaperTarget,
+} from './mailbox_client';
+import { enqueueWallpaper, supersedeQueuedPrimaryWallpapers } from './outbox';
+import {
+    noteReaderUnreachable,
+    resolveReaderReachability,
+    type ReaderReachability,
+    type ReaderReachabilityHint,
+    type SendPhase,
+} from './reader_reachability';
+import { asRole } from './role';
 import { getDeviceBaseUrl, sanitizeDevicePath } from './settings';
 
 // ---------------------------------------------------------------------------
@@ -676,4 +704,469 @@ function describeError(error: unknown): string {
     if (error instanceof Error && error.message) return error.message;
     if (typeof error === 'string' && error) return error;
     return 'Wallpaper upload failed.';
+}
+
+// ---------------------------------------------------------------------------
+// Routing — the same three roads notes and books already had
+// ---------------------------------------------------------------------------
+
+/**
+ * A wallpaper can reach the reader two ways, and {@link routeWallpaperSend} is
+ * the one place that decides which.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS SCREEN USED TO BE THE LAST DIRECT-ONLY ONE
+ * ---------------------------------------------------------------------------
+ * {@link sendWallpaperBmp} PUTs the BMP at the reader's own HTTP/WS API, so it
+ * needs the reader AWAKE and on this LAN. The reader is asleep with its radio
+ * off almost all of the time, and a client phone has no LAN path to it at all —
+ * so "change what your partner's reader shows while it sleeps" was a button that
+ * was grey nearly every time anyone looked at it, and the model behind it
+ * (`useDirectConnectionRequired`) said so out loud.
+ *
+ * That is no longer true, and nothing about the DEVICE changed to make it true:
+ * the mailbox the reader already polls for notes and books now carries
+ * wallpapers too (`mailbox_client.publishWallpaper`), and the phone's own outbox
+ * can hold one for a peer-link handover. So this module gained the same routing
+ * `love_note_sender.routeLoveNote` and `epub_sender.routeEpubSend` have had, and
+ * it is a DELIBERATE MIRROR of the book one — same role gate, same fast skip,
+ * same mailbox fallback, same auto-arm — because the same asleep reader must not
+ * be handled three different ways.
+ */
+export type WallpaperRoute = 'direct' | 'mailbox';
+
+/**
+ * What the UI says a route MEANT, once it succeeded.
+ *
+ * 'In the mailbox' rather than 'Sent', and the distinction is the honest one:
+ * the mailbox route puts the picture in a box the reader collects on its own
+ * schedule, so the panel does not change until the reader next syncs — which can
+ * be hours. Same wording, and same reason, as `EPUB_ROUTE_LABEL`.
+ */
+export const WALLPAPER_ROUTE_LABEL: Record<WallpaperRoute, string> = {
+    direct: 'On the reader',
+    mailbox: 'In the mailbox',
+};
+
+/**
+ * The one wording for what a mailbox delivery means, as a constant, so no two
+ * surfaces can promise different things about the same picture.
+ */
+export const WALLPAPER_MAILBOX_LANDING_CLAUSE = 'will land on the reader next sync';
+
+/**
+ * The one wording for what a HANDOVER-parked wallpaper means.
+ *
+ * Different promise from the mailbox one and it must read differently: nothing
+ * is delivered until the user runs Sync-with-reader in the reader's physical
+ * presence. Saying "next sync" for both would tell someone with no mailbox that
+ * their picture is on its way when it is sitting on their phone waiting for
+ * them to do something.
+ */
+export const WALLPAPER_HANDOVER_LANDING_CLAUSE =
+    'is saved on this phone and hands over at the next Sync with reader';
+
+/** One route attempt, in the order it was tried. */
+export interface WallpaperRouteAttempt {
+    route: WallpaperRoute;
+    success: boolean;
+    error?: string;
+}
+
+/**
+ * The settings a send depends on, as a plain structure.
+ *
+ * Structurally identical to `EpubDestination` and `LoveNoteDestination` on
+ * purpose — all three routes are chosen from the SAME four facts and share
+ * `isMailboxConfigured` — but declared here so a caller does not have to import
+ * a book type to set a sleep screen.
+ */
+export interface WallpaperDestination {
+    role: Role;
+    /** Reader host for the direct route (already normalised, e.g. getCurrentIp). */
+    ip: string;
+    /** Mailbox base URL. Empty/absent means "no mailbox configured". */
+    mailboxUrl?: string;
+    /** Mailbox bearer token. NEVER part of mailboxUrl — see mailbox_client. */
+    mailboxWriteToken?: string;
+}
+
+/** `UploadResult` plus which route delivered the wallpaper. */
+export interface RouteWallpaperResult extends UploadResult {
+    /** The route that delivered it. Absent when nothing delivered it. */
+    route?: WallpaperRoute;
+    /** Every route tried, in order — so the UI can say "reader was asleep". */
+    attempts: WallpaperRouteAttempt[];
+    /** Which slot the send was aimed at. Always present, even on a failure. */
+    target: MailboxWallpaperTarget;
+    /** The name it landed under. Absent for a primary, whose path is fixed. */
+    filename?: string;
+    /** Mailbox id, on the mailbox route only. */
+    wallpaperId?: string;
+    /**
+     * Outbox id, when the wallpaper was ALSO parked on this phone for handover.
+     *
+     * Present means a copy of the BMP is on local disk and the next peer-link
+     * session serves it to the reader with no internet and no further taps.
+     */
+    queuedId?: string;
+    /**
+     * The reachability answer that made this send SKIP the direct route.
+     *
+     * Present ONLY on the fast skip. Its absence means "direct was tried, or
+     * there was nothing to try" — never "the reader was reachable".
+     */
+    skippedDirect?: ReaderReachability;
+}
+
+export interface RouteWallpaperOptions {
+    /** Mailbox id to reuse for a retry. A NEW id is minted when absent. */
+    wallpaperId?: string;
+    /**
+     * Park the wallpaper in the outbox when no route delivered it. Default TRUE.
+     *
+     * The auto-arm. It matters here for a reason it does not for a note: a
+     * wallpaper is the thing a user sets while standing next to a reader that is
+     * asleep, which is exactly the case the peer link exists for.
+     */
+    queueOnFailure?: boolean;
+    /** Park it even when a route DID deliver it. Default false. */
+    alwaysQueue?: boolean;
+    /** Narration for the UI, in the order the phases happen. */
+    onPhase?: (phase: SendPhase) => void;
+    /**
+     * What the app already knows about whether the reader is answering.
+     *
+     * Fresh enough and this send asks nothing extra; stale or absent and the
+     * fast skip runs its own short probe. Either way it only ever DECIDES
+     * anything when a mailbox fallback exists. See `reader_reachability`.
+     */
+    reachability?: ReaderReachabilityHint | null;
+}
+
+/**
+ * Park one wallpaper in the outbox. Best-effort, NEVER throws, returns the id or
+ * null.
+ *
+ * A PRIMARY ALSO RETIRES ANY OLDER QUEUED PRIMARY. There is one `/sleep.bmp` on
+ * the card, so a queue holding three of them can deliver one and the other two
+ * are not "waiting" — they are two wake windows of radio spent to be
+ * overwritten. Same collapse, and the same reasoning, as `sendLoveNote`'s
+ * `supersedeQueuedNotes`; the ROTATION set is deliberately left alone, because
+ * every entry there is a distinct file the user chose to add.
+ */
+export async function queueWallpaperForHandover(
+    bmp: Uint8Array,
+    target: MailboxWallpaperTarget,
+    filename?: string,
+    wallpaperId?: string
+): Promise<string | null> {
+    try {
+        const item = await enqueueWallpaper(
+            bmp,
+            wallpaperId ?? mintWallpaperId(),
+            target,
+            filename
+        );
+        if (target === 'primary') {
+            // Swallows its own failure: queuing SUCCEEDED, and that is what this
+            // function reports. A stale extra primary is a wasted window, not a
+            // lost picture.
+            try {
+                await supersedeQueuedPrimaryWallpapers(item.id);
+            } catch (error) {
+                console.warn('[Wallpaper] Could not retire the older queued sleep screens:', error);
+            }
+        }
+        return item.id;
+    } catch (error) {
+        console.warn('[Wallpaper] Could not queue the wallpaper for handover:', error);
+        return null;
+    }
+}
+
+/**
+ * Why this destination's mailbox cannot be used, or null when it can.
+ *
+ * The DECISION is `love_note_sender.isMailboxConfigured`, not re-derived, so a
+ * note, a book and a wallpaper can never disagree about whether a mailbox is
+ * usable. Only the WORDING is local, and it splits the same way `epub_sender`
+ * does: "not set up at all" gets the canonical hint, while a URL that IS set but
+ * malformed gets the specific defect — telling someone who already typed a URL
+ * to go set one up tells them nothing about what is wrong with it.
+ */
+function describeWallpaperMailboxProblem(destination: WallpaperDestination): string | null {
+    if (isMailboxConfigured(destination)) return null;
+    const url = (destination?.mailboxUrl ?? '').trim();
+    const token = (destination?.mailboxWriteToken ?? '').trim();
+    if (!url || !token) return MAILBOX_SETUP_HINT;
+    return describeMailboxUrlProblem(url) ?? MAILBOX_SETUP_HINT;
+}
+
+/**
+ * Send one wallpaper by whichever route this phone has.
+ *
+ *   role 'client'  -> MAILBOX ONLY. A client has no LAN access to the reader by
+ *                     definition, so there is nothing to fall back FROM; with no
+ *                     mailbox configured the send fails with
+ *                     {@link MAILBOX_SETUP_HINT} and never touches the network.
+ *   role 'host'    -> DIRECT FIRST, mailbox as a fallback when the reader did not
+ *                     answer and a mailbox is configured.
+ *
+ *                     "Direct first" means ASK first: when a mailbox fallback
+ *                     exists, `reader_reachability` answers "is it awake?" from
+ *                     ConnectionProvider's recent probe or a 2.5 s one of its
+ *                     own, and a reader that is not answering is skipped. With
+ *                     NO usable mailbox nothing is skipped — direct is the only
+ *                     road there is, and a wrong probe must not turn a slow send
+ *                     into a failed one.
+ *
+ * DIRECT IS STILL PREFERRED, and for a reason specific to this payload: only the
+ * direct route can DELETE the old file first, which is what makes a re-write of
+ * `/sleep.bmp` work at all (the firmware refuses to overwrite in place — see
+ * DELETE BEFORE UPLOAD in the header). The mailbox route has no such problem
+ * because the reader writes the file itself, but the immediate, verifiable
+ * result is worth having when the reader is actually awake.
+ *
+ * THE TARGET AND THE NAME ARE RESOLVED ONCE, up front, so an unusable rotation
+ * name fails identically on both roads and can never trigger a pointless
+ * fallback — the mailbox would refuse it too, and a picture that reached the
+ * mailbox under a name the reader cannot create is a silent, permanent failure.
+ *
+ * NEVER THROWS.
+ */
+export async function routeWallpaperSend(
+    destination: WallpaperDestination,
+    bmp: Uint8Array,
+    target: WallpaperTarget,
+    onProgress?: (percent: number) => void,
+    options?: RouteWallpaperOptions
+): Promise<RouteWallpaperResult> {
+    const result = await routeWallpaperLegs(destination, bmp, target, onProgress, options);
+
+    // THE HANDOVER QUEUE, last, for the reason `routeEpubSend` runs it last: it
+    // delivers nothing by itself, so it can never make `success` true or fill in
+    // `route`. It only converts a failed send from "the picture is lost" into
+    // "the picture is on the phone and the reader takes it the next time the two
+    // are in the same room" — with no internet on either side.
+    const shouldQueue =
+        options?.alwaysQueue === true || (!result.success && options?.queueOnFailure !== false);
+    if (!shouldQueue) return result;
+
+    const queuedId = await queueWallpaperForHandover(
+        bmp,
+        result.target,
+        result.filename,
+        // Reuse the mailbox id when there is one, so a wallpaper that is
+        // half-published and later handed over is ONE item to the reader.
+        result.wallpaperId ?? options?.wallpaperId
+    );
+    // Omitted rather than undefined, so a result that queued nothing is
+    // byte-identical to what the routing legs returned.
+    return queuedId ? { ...result, queuedId } : result;
+}
+
+/** The routing decision itself — everything {@link routeWallpaperSend} did before the queue. */
+async function routeWallpaperLegs(
+    destination: WallpaperDestination,
+    bmp: Uint8Array,
+    target: WallpaperTarget,
+    onProgress?: (percent: number) => void,
+    options?: RouteWallpaperOptions
+): Promise<RouteWallpaperResult> {
+    const attempts: WallpaperRouteAttempt[] = [];
+    // Before anything is resolved: a caller that passed a garbage target gets a
+    // result whose `target` field still has to say something, and 'primary' is
+    // the one value that is never a guess about a NAME.
+    const wireTarget: MailboxWallpaperTarget =
+        target && (target as { kind?: string }).kind === 'set' ? 'set' : 'primary';
+
+    if (!bmp || bmp.byteLength < 2 || bmp[0] !== BMP_MAGIC_B || bmp[1] !== BMP_MAGIC_M) {
+        // The SAME guard `sendWallpaperBmp` applies, hoisted so it fires before a
+        // route is chosen rather than once per road.
+        return {
+            success: false,
+            error:
+                'Wallpaper payload is not a BMP (expected a "BM" header from prepareWallpaperBmp).',
+            attempts,
+            target: wireTarget,
+        };
+    }
+
+    const resolved = resolveWallpaperTarget(target);
+    if (!resolved) {
+        return {
+            success: false,
+            error:
+                target && (target as { kind?: string }).kind === 'set'
+                    ? `Unusable wallpaper name: ${JSON.stringify((target as { name?: unknown }).name ?? '')}`
+                    : 'Unknown wallpaper target.',
+            attempts,
+            target: wireTarget,
+        };
+    }
+
+    // A primary has NO name on the wire: its destination is the fixed
+    // `/sleep.bmp`, and carrying `sleep.bmp` as a filename would invite a reader
+    // to treat it as a rotation entry.
+    const wireName = wireTarget === 'set' ? resolved.filename : undefined;
+
+    // Tolerant of a settings blob written before the role existed, exactly like
+    // every other read of it (role.ts).
+    const role = asRole(destination?.role);
+    const mailboxProblem = describeWallpaperMailboxProblem(destination);
+    const onPhase = options?.onPhase;
+
+    if (role === 'client') {
+        if (mailboxProblem !== null) {
+            // Nothing left the phone: a client has no direct route, and the
+            // mailbox is not usable.
+            return { success: false, error: mailboxProblem, attempts, target: wireTarget };
+        }
+        onPhase?.('mailbox');
+        return sendWallpaperViaMailboxLeg(
+            destination,
+            bmp,
+            wireTarget,
+            wireName,
+            attempts,
+            onProgress,
+            options
+        );
+    }
+
+    // Host. Fast skip, and only where it is free — see `routeEpubLegs`.
+    let reachability: ReaderReachability | null = null;
+    if (mailboxProblem === null) {
+        onPhase?.('looking');
+        reachability = await resolveReaderReachability(destination.ip, options?.reachability);
+    }
+
+    if (reachability && !reachability.reachable) {
+        // Nothing was TRIED against the reader, so no 'direct' attempt is
+        // recorded — `attempts` stays a log of what actually ran.
+        onPhase?.('mailbox');
+        const skipped = await sendWallpaperViaMailboxLeg(
+            destination,
+            bmp,
+            wireTarget,
+            wireName,
+            attempts,
+            onProgress,
+            options
+        );
+        if (skipped.success) return { ...skipped, skippedDirect: reachability };
+        return {
+            ...skipped,
+            error: `Reader unreachable (${reachability.error || 'no answer'}); mailbox failed too: ${skipped.error}`,
+            skippedDirect: reachability,
+        };
+    }
+
+    onPhase?.('direct');
+    const direct = await sendWallpaperBmp(destination.ip, bmp, target, onProgress);
+    attempts.push({ route: 'direct', success: direct.success, error: direct.error });
+    if (direct.success) {
+        return {
+            success: true,
+            route: 'direct',
+            attempts,
+            target: wireTarget,
+            filename: wireName,
+        };
+    }
+
+    const directError = direct.error || 'Reader did not answer';
+
+    if (!isDeviceUnreachableError(direct.error)) {
+        // The reader ANSWERED and refused (a full card, a rejected overwrite).
+        // Re-sending through the mailbox would hide a real device condition
+        // behind a delayed delivery the user cannot see.
+        return {
+            success: false,
+            error: directError,
+            attempts,
+            target: wireTarget,
+            filename: wireName,
+        };
+    }
+
+    // A dead upload is a stronger observation than the probe that preceded it.
+    // Recorded so the next send skips the stall this one just paid for.
+    noteReaderUnreachable(destination.ip, directError);
+
+    if (mailboxProblem !== null) {
+        return {
+            success: false,
+            error:
+                mailboxProblem === MAILBOX_SETUP_HINT
+                    ? `Reader unreachable (${directError}). ${MAILBOX_SETUP_HINT} to set a sleep screen while it is asleep.`
+                    : `Reader unreachable (${directError}). Mailbox unusable: ${mailboxProblem}`,
+            attempts,
+            target: wireTarget,
+            filename: wireName,
+        };
+    }
+
+    onPhase?.('mailbox');
+    const viaMailbox = await sendWallpaperViaMailboxLeg(
+        destination,
+        bmp,
+        wireTarget,
+        wireName,
+        attempts,
+        onProgress,
+        options
+    );
+    if (viaMailbox.success) return viaMailbox;
+
+    return {
+        ...viaMailbox,
+        error: `Reader unreachable (${directError}); mailbox failed too: ${viaMailbox.error}`,
+    };
+}
+
+/** Shared mailbox leg. Appends its own attempt row. */
+async function sendWallpaperViaMailboxLeg(
+    destination: WallpaperDestination,
+    bmp: Uint8Array,
+    target: MailboxWallpaperTarget,
+    filename: string | undefined,
+    attempts: WallpaperRouteAttempt[],
+    onProgress?: (percent: number) => void,
+    options?: RouteWallpaperOptions
+): Promise<RouteWallpaperResult> {
+    const published = await publishWallpaper(
+        (destination.mailboxUrl ?? '').trim(),
+        (destination.mailboxWriteToken ?? '').trim(),
+        bmp,
+        target,
+        filename,
+        options?.wallpaperId,
+        onProgress
+    );
+    attempts.push({ route: 'mailbox', success: published.success, error: published.error });
+
+    if (published.success) {
+        return {
+            success: true,
+            route: 'mailbox',
+            attempts,
+            target: published.target ?? target,
+            // The SERVER's name, not ours: `X-Filename` is sanitized server-side,
+            // so the name the reader will create can legitimately differ from the
+            // one sent, and a UI reporting the name it asked for would name a
+            // file that is not on the card. '' (a primary) stays undefined.
+            filename: published.filename || filename,
+            wallpaperId: published.id,
+        };
+    }
+    return {
+        success: false,
+        error: published.error,
+        attempts,
+        target: published.target ?? target,
+        filename: published.filename || filename,
+        wallpaperId: published.id,
+    };
 }

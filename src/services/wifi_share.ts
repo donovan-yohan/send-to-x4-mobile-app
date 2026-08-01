@@ -13,7 +13,8 @@
  * ANDROID CANNOT READ THE CURRENT NETWORK'S PASSWORD, for any app, at any API
  * level, with any permission. There is no prefill to be had and no permission
  * worth asking for: this module stages what the user typed and nothing else.
- * (The SSID is not prefilled either — see {@link WIFI_SHARE_NO_PREFILL}.)
+ * (The SSID *is* offered, on request — see {@link WIFI_SHARE_PREFILL_HELP} and
+ * `services/wifi_ssid`. The password is the part with no API behind it.)
  *
  * ---------------------------------------------------------------------------
  * THE SHAPE, AND WHY IT IS NOT THE OUTBOX
@@ -93,26 +94,39 @@ export const WIFI_SHARE_DIR_NAME = 'wifi-share';
 export const WIFI_SHARE_FILENAME = 'credentials.txt';
 
 /**
- * Why the SSID field starts EMPTY, stated once so nobody re-litigates it in a
- * screen.
+ * Why the SSID field starts empty AND why there is a button next to it.
  *
  * Reading the SSID of the network the phone is on is a location-grade operation
  * on Android 8.1+: `WifiInfo.getSSID()` (however it is reached — `WifiManager`,
- * or `NetworkCapabilities.getTransportInfo()` on a callback) returns
+ * or `NetworkCapabilities.getTransportInfo()` on API 29+) returns
  * `<unknown ssid>` unless the caller holds ACCESS_FINE_LOCATION and location
- * services are on. `NEARBY_WIFI_DEVICES`, which this app DOES hold, is declared
- * for the peer-join path and does not unlock it — and on this app's own
- * declaration it is the `neverForLocation` shape, which exists precisely to
- * promise the OS that the app is not deriving location from WiFi.
+ * services are on. `NEARBY_WIFI_DEVICES`, which this app also holds, is declared
+ * for the peer-join path and does not unlock it.
  *
- * So the choice is: add a dangerous location permission and a runtime-request
- * flow to save one line of typing, or let the user type the SSID they can read
- * off their own phone's status bar. The field starts empty.
+ * THIS PARAGRAPH USED TO SAY TWO THINGS THAT WERE WRONG, recorded because a
+ * rationale that has quietly become false is worse than no rationale:
+ *
+ *   1. It said the app declared NEARBY_WIFI_DEVICES in the `neverForLocation`
+ *      shape. IT NEVER DID. `android.permissions` in app.config.ts emits a bare
+ *      <uses-permission>, the prebuilt manifest carries no flags on it, and no
+ *      dependency merges one in. Nothing had to be removed to make the prefill
+ *      work — but the flag must never be ADDED, because it is a promise that the
+ *      app derives no location from WiFi and the platform keeps that promise by
+ *      redacting exactly this field.
+ *   2. It said the choice was "a dangerous permission and a request flow, or let
+ *      the user type it". That was the decision at the time and it has been
+ *      reversed deliberately: the permission is declared (in the reader-link
+ *      module manifest) and requested from ONE button, inside this sheet, at the
+ *      moment the user asks for the name to be filled in. Not at launch, not by
+ *      any other feature.
+ *
+ * The field stays editable in every state, and typing is still the fallback for
+ * every case Android will not answer: denied, blocked, not on WiFi, or location
+ * services switched off device-wide. See `services/wifi_ssid` for the states.
  */
-export const WIFI_SHARE_NO_PREFILL =
-    "Android only reveals the current network's name to apps that hold location permission, " +
-    'which this app deliberately does not ask for. Type the network name as it appears in your ' +
-    "phone's WiFi settings.";
+export const WIFI_SHARE_PREFILL_HELP =
+    "Android only reveals the current network's name to apps that hold location permission. " +
+    'You can let it fill in below, or type the name as it appears in your WiFi settings.';
 
 /** WPA2 PSK bounds, mirrored by the native validator and by the firmware. */
 export const WIFI_PSK_MIN_CHARS = 8;

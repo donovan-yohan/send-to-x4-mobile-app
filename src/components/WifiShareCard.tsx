@@ -18,20 +18,36 @@
  * feature that cannot lose an argument with a merge.
  *
  * ---------------------------------------------------------------------------
- * THE SSID FIELD STARTS EMPTY, AND THAT IS NOT AN OVERSIGHT
+ * THE SSID FIELD IS PREFILLABLE, AND THE PERMISSION IS ASKED FOR *HERE*
  * ---------------------------------------------------------------------------
- * Android will not tell an app the name of the network it is on without
- * location permission — see {@link WIFI_SHARE_NO_PREFILL} in
- * `services/wifi_share`, which is rendered here rather than buried in a comment,
- * because a user looking at an empty field that "obviously" could be filled in
- * deserves the reason. The app deliberately holds no location permission.
+ * Android will not tell an app the name of the network it is on without location
+ * permission. This card used to state that as a closed door and leave the field
+ * empty; it now offers to open it, from one button, at the only moment where
+ * asking is honest — the user is looking at the field and has just been told
+ * what the permission is for.
+ *
+ * THE RULES THIS FLOW OBEYS, all of them visible in `openSheet` and `prefill`
+ * below:
+ *   - NOTHING IS REQUESTED ON MOUNT, or at app launch, or anywhere else in the
+ *     app. Opening the sheet only CHECKS (`checkFineLocationPermission` never
+ *     prompts). The system dialog appears on a tap and on nothing else.
+ *   - THE EXPLAINER COMES FIRST. `WIFI_PREFILL_NOTE` is on screen before the
+ *     button can be pressed, because a system permission dialog with no context
+ *     is one people deny by reflex.
+ *   - THE FIELD IS EDITABLE IN EVERY STATE. Granted, denied, permanently denied,
+ *     not on WiFi, location services off, native module one build behind — every
+ *     branch ends at a field the user can type into, and the note says so.
+ *   - A PREFILL NEVER CLOBBERS. It fills an empty field; a staged SSID offered
+ *     back by `openSheet`, or anything typed, wins over a speculative read.
+ * The state machine behind the copy is `describeWifiPrefill` in
+ * `services/wifi_ssid`, kept pure so `scripts/wifi-ssid.test.js` pins every cell.
  *
  * There is no password prefill for anyone, ever: no Android API returns a saved
  * PSK to a non-system app. That is why this is typed once, here, instead of
  * being read off the phone.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     Modal,
     ScrollView,
@@ -46,7 +62,7 @@ import {
 
 import { useTheme, type Theme } from '../theme';
 import {
-    WIFI_SHARE_NO_PREFILL,
+    WIFI_SHARE_PREFILL_HELP,
     clearWifiShare,
     describeWifiShare,
     getWifiShare,
@@ -54,6 +70,19 @@ import {
     subscribeWifiShare,
     type WifiShareRecord,
 } from '../services/wifi_share';
+import {
+    checkFineLocationPermission,
+    ensureFineLocationPermission,
+    type FineLocationState,
+} from '../services/android_permissions';
+import {
+    WIFI_PREFILL_NOTE,
+    describeWifiPrefill,
+    readCurrentSsid,
+    wifiPrefillButtonRequests,
+    wifiPrefillHasButton,
+    type SsidReadReason,
+} from '../services/wifi_ssid';
 
 export interface WifiShareCardProps {
     style?: StyleProp<ViewStyle>;
@@ -70,6 +99,48 @@ export function WifiShareCard({ style }: WifiShareCardProps) {
     const [reveal, setReveal] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [saving, setSaving] = useState(false);
+
+    // Prefill state. `permission` is null until the (non-prompting) check for
+    // this opening lands, which is what keeps the sheet from flashing an
+    // "allow location" affordance at someone who already granted it.
+    const [permission, setPermission] = useState<FineLocationState | null>(null);
+    const [readReason, setReadReason] = useState<SsidReadReason | null>(null);
+    const [prefilling, setPrefilling] = useState(false);
+
+    // Every opening of the sheet gets a token, and an async result from an
+    // earlier one is DROPPED. Without it, a permission dialog answered after the
+    // user backed out writes an SSID into the state that `closeSheet` just
+    // cleared, and it reappears on the next open as if it had been typed.
+    const openToken = useRef(0);
+
+    /**
+     * The single value the prefill UI renders from, so that "which note" and
+     * "is there a button" cannot drift apart.
+     *
+     * `null` permission means the check for this opening has not landed yet
+     * (roughly one frame). It renders the neutral help line and NO button rather
+     * than guessing, because guessing wrong shows an "allow location" prompt to
+     * someone who has already allowed it.
+     */
+    const prefillState = useMemo(
+        () => (permission === null ? null : describeWifiPrefill(permission, readReason)),
+        [permission, readReason]
+    );
+
+    /**
+     * The one line under the field, or nothing.
+     *
+     * `unsupported` is the only state that renders NOTHING: on a platform with
+     * no such permission there is no decision to explain, and the generic help
+     * line talks about Android. Every other state either has its own note or
+     * falls back to the general one, so the field is never bare while the check
+     * is in flight.
+     */
+    const prefillHelp = useMemo(() => {
+        if (prefillState === null) return WIFI_SHARE_PREFILL_HELP;
+        if (prefillState === 'unsupported') return null;
+        return WIFI_PREFILL_NOTE[prefillState] ?? WIFI_SHARE_PREFILL_HELP;
+    }, [prefillState]);
 
     // Read once, then follow. The subscription is what makes the handover
     // visible: the sync session wipes the staging on the reader's ack, and this
@@ -96,18 +167,90 @@ export function WifiShareCard({ style }: WifiShareCardProps) {
         setPassword('');
         setReveal(false);
         setError(null);
+        setPermission(null);
+        setReadReason(null);
+        setPrefilling(false);
         setOpen(true);
+
+        // CHECK, NEVER REQUEST. This runs on open, so it must not be able to
+        // raise a dialog: `checkFineLocationPermission` is the non-prompting
+        // half of the pair. When the grant is already in place from a previous
+        // visit the read happens silently here and the user never sees the
+        // permission flow at all — which is the whole point of separating the
+        // two calls.
+        const token = ++openToken.current;
+        void (async () => {
+            const state = (await checkFineLocationPermission()).state;
+            if (openToken.current !== token) return;
+            setPermission(state);
+            if (state !== 'granted') return;
+
+            const read = await readCurrentSsid();
+            if (openToken.current !== token) return;
+            setReadReason(read.reason);
+            // Fills an EMPTY field only. A staged SSID offered back above, or
+            // anything typed while this was in flight, outranks the read.
+            if (read.ssid) setSsid(current => (current.trim().length === 0 ? read.ssid! : current));
+        })();
     }, [record]);
 
     const closeSheet = useCallback(() => {
         setOpen(false);
+        // Invalidate any in-flight permission/read for this opening.
+        openToken.current += 1;
         // Dropped on the way out rather than left in state: a passphrase has no
         // reason to outlive the sheet it was typed into.
         setSsid('');
         setPassword('');
         setReveal(false);
         setError(null);
+        setPermission(null);
+        setReadReason(null);
+        setPrefilling(false);
     }, []);
+
+    /**
+     * "Use current network" — THE ONLY PLACE IN THIS APP THAT REQUESTS LOCATION.
+     *
+     * Requests only when the state says a request is what is missing
+     * (`wifiPrefillButtonRequests`); with the grant already held it goes straight
+     * to the read, so the app can never fire a system dialog it does not need.
+     *
+     * Unlike the speculative read in `openSheet`, this DOES overwrite the field:
+     * the user asked for it by name.
+     */
+    const prefill = useCallback(() => {
+        // `prefillState === null` is unreachable from the UI (the button does not
+        // exist until the check lands) and is a no-op rather than a guess.
+        if (prefilling || prefillState === null) return;
+        const token = openToken.current;
+        setPrefilling(true);
+        void (async () => {
+            try {
+                if (wifiPrefillButtonRequests(prefillState)) {
+                    const granted = await ensureFineLocationPermission();
+                    if (openToken.current !== token) return;
+                    setPermission(granted.state);
+                    if (!granted.granted) {
+                        // The note for `denied`/`blocked` carries it from here.
+                        setReadReason(null);
+                        return;
+                    }
+                }
+                const read = await readCurrentSsid();
+                if (openToken.current !== token) return;
+                setReadReason(read.reason);
+                if (read.ssid) {
+                    setSsid(read.ssid);
+                    setError(null);
+                }
+            } finally {
+                if (openToken.current === token) setPrefilling(false);
+            }
+        })();
+        // `prefillState` is read at call time from the render that owns this
+        // handler, which is the state the user was looking at when they tapped.
+    }, [prefilling, prefillState]);
 
     const save = useCallback(() => {
         if (saving) return;
@@ -187,7 +330,27 @@ export function WifiShareCard({ style }: WifiShareCardProps) {
                                 autoCorrect={false}
                                 accessibilityLabel="WiFi network name"
                             />
-                            <Text style={styles.help}>{WIFI_SHARE_NO_PREFILL}</Text>
+
+                            {/* THE EXPLAINER IS ALWAYS ON SCREEN BEFORE THE
+                                BUTTON CAN BE PRESSED — that ordering is the
+                                consent story, not decoration. Until the
+                                permission check for this opening lands there is
+                                no button at all and the neutral help line
+                                stands in, so nothing ever flickers between two
+                                different asks. */}
+                            {prefillHelp ? <Text style={styles.help}>{prefillHelp}</Text> : null}
+                            {prefillState !== null && wifiPrefillHasButton(prefillState) ? (
+                                <TouchableOpacity
+                                    onPress={prefill}
+                                    disabled={prefilling}
+                                    accessibilityRole="button"
+                                    accessibilityLabel="Fill in the name of the network this phone is on"
+                                >
+                                    <Text style={styles.reveal}>
+                                        {prefilling ? 'Checking…' : 'Use current network'}
+                                    </Text>
+                                </TouchableOpacity>
+                            ) : null}
 
                             <Text style={styles.fieldLabel}>Password</Text>
                             <TextInput

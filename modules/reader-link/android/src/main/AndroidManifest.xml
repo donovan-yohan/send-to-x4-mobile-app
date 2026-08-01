@@ -22,15 +22,40 @@
                               src/services/android_permissions.ts already requests it.
       - INTERNET              (the upstream forward)
 
-    NOT declared, deliberately: ACCESS_FINE_LOCATION. On Android 12 and lower the Wi-Fi
-    Network Request API wants it (and location services ON). The target device for this
-    milestone is a Pixel on Android 13+, where NEARBY_WIFI_DEVICES replaces it, and adding a
-    dangerous location permission for older devices would need a runtime-request flow the app
-    does not have. If Android 12 support is ever needed, add
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-                     android:maxSdkVersion="32" />
-    here and extend src/services/android_permissions.ts to request it.
+    ACCESS_FINE_LOCATION is declared below, and the reason CHANGED. This comment used to say
+    it was deliberately absent, on the grounds that NEARBY_WIFI_DEVICES covers the peer join
+    on Android 13+ and that a dangerous permission was not worth a runtime-request flow the
+    app did not have. That is still true OF THE JOIN. It is not true of reading the name of
+    the network the phone is already on, which is the SSID prefill in "Share WiFi with
+    reader": WifiInfo.getSSID() returns the literal "<unknown ssid>" to any caller without
+    location permission, whichever route it is reached by (WifiManager.getConnectionInfo, or
+    NetworkCapabilities.getTransportInfo on API 29+), and NEARBY_WIFI_DEVICES does not unlock
+    it. See modules/reader-link/.../CurrentSsid.kt for the read and its reason codes.
+
+    THE SCOPE OF THIS IS ONE BUTTON. The app now HAS a runtime-request flow
+    (src/services/android_permissions.ts, ensureFineLocationPermission) and it is invoked
+    from exactly one place: the "Use current network" button inside the WiFi-share sheet.
+    Nothing requests location at launch, no other feature calls it, and the SSID field stays
+    editable whether the permission is granted, denied or never asked for. Declaring the
+    permission is what makes that button possible; it does not make the app a location
+    consumer.
+
+    It lives HERE, in the module manifest, for the same reason CHANGE_NETWORK_STATE does:
+    `android/` is prebuild output and a regeneration would drop anything that only existed
+    there, while a library manifest is merged on every build.
+
+    NEARBY_WIFI_DEVICES IS DECLARED WITHOUT `android:usesPermissionFlags="neverForLocation"`,
+    and that is now load-bearing rather than incidental. That flag is a promise to the OS
+    that the app does not derive physical location from Wi-Fi results; the platform honours
+    it by stripping location-bearing data from what those APIs return. An app that asserts it
+    while also reading the current SSID is asserting something false, and on the strict
+    reading the flag is what would keep the read redacted. Checked at the time of this
+    change: the flag appears in NO manifest in this repo (app.config.ts `android.permissions`
+    emits a bare uses-permission, the prebuilt android/app/src/main/AndroidManifest.xml has
+    no flags on line 5, and no dependency manifest merges one in). So nothing had to be
+    removed. If anyone adds it later, the SSID prefill is what breaks.
   -->
   <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
 </manifest>

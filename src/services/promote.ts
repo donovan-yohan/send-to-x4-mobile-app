@@ -103,7 +103,13 @@
  */
 
 import type { MessageRecord } from './message_history';
-import { sendWallpaperBmp, sleepSetNameForId } from './wallpaper_sender';
+import {
+    routeWallpaperSend,
+    sendWallpaperBmp,
+    sleepSetNameForId,
+    type WallpaperDestination,
+    type WallpaperRoute,
+} from './wallpaper_sender';
 
 /**
  * Discriminated, because success carries something the caller needs — the
@@ -118,7 +124,23 @@ import { sendWallpaperBmp, sleepSetNameForId } from './wallpaper_sender';
  * union makes a mismatched pair unrepresentable rather than merely discouraged.
  */
 export type PromoteResult =
-    | { ok: true; success: true; name: string }
+    | {
+          ok: true;
+          success: true;
+          name: string;
+          /**
+           * Which road carried it, when the caller asked for routing.
+           *
+           * OPTIONAL, and absent on the legacy direct-only call shape, so a
+           * caller that passes a bare `ip` gets byte-identical results to what
+           * this function has always returned. Present means the caller can (and
+           * should) word its banner differently for 'mailbox' — the bytes are in
+           * a box the reader collects later, not on the card.
+           */
+          route?: WallpaperRoute;
+          /** True when nothing delivered it but a copy was parked for handover. */
+          queued?: boolean;
+      }
     | { ok: false; success: false; error: string };
 
 /**
@@ -237,12 +259,26 @@ function loadImageConverter(): WallpaperPrepare | null {
  * see the picture — the reader's sleep mode still has to be CUSTOM, which no
  * remote API can set today. Pair this with `SLEEP_MODE_HINT` in the UI.
  *
- * @param ip         Reader host (settings.crossPointIp — normalised downstream).
+ * ---------------------------------------------------------------------------
+ * TWO CALL SHAPES, AND ONLY ONE OF THEM CAN REACH AN ASLEEP READER
+ * ---------------------------------------------------------------------------
+ * `target` is either a bare reader host — the ORIGINAL shape, direct-LAN only,
+ * kept so every existing caller and test is untouched — or a full
+ * {@link WallpaperDestination}, which routes: reader first when there is any
+ * point, mailbox when it is asleep, outbox when neither worked.
+ *
+ * The distinction is not cosmetic. Promote lives on a list of notes the user
+ * already sent, and the reader is asleep almost always, so the direct-only shape
+ * is a button that fails for the ordinary case. New callers should pass the
+ * destination; the string overload exists so this change could not break the
+ * ones that already existed.
+ *
+ * @param target     Reader host (direct only), or a destination (routed).
  * @param record     The history row being promoted.
- * @param onProgress 0-100 upload progress, forwarded from the WS transport.
+ * @param onProgress 0-100 upload progress, forwarded from the transport.
  */
 export async function promoteRecordToWallpaper(
-    ip: string,
+    target: string | WallpaperDestination,
     record: MessageRecord,
     onProgress?: (percent: number) => void
 ): Promise<PromoteResult> {
@@ -301,12 +337,29 @@ export async function promoteRecordToWallpaper(
         };
     }
 
-    const result = await sendWallpaperBmp(ip, bmp, { kind: 'set', name }, onProgress);
-    if (!result.success) {
-        return { ok: false, success: false, error: result.error || 'Wallpaper upload failed.' };
+    if (typeof target === 'string') {
+        // LEGACY SHAPE: direct only, byte-identical to what this function has
+        // always done, so a caller that has not been taught about routing is not
+        // silently given a delayed delivery it has no wording for.
+        const result = await sendWallpaperBmp(target, bmp, { kind: 'set', name }, onProgress);
+        if (!result.success) {
+            return { ok: false, success: false, error: result.error || 'Wallpaper upload failed.' };
+        }
+        return { ok: true, success: true, name };
     }
 
-    return { ok: true, success: true, name };
+    const routed = await routeWallpaperSend(target, bmp, { kind: 'set', name }, onProgress);
+    if (routed.success) {
+        return { ok: true, success: true, name, route: routed.route };
+    }
+    if (routed.queuedId) {
+        // Nothing delivered it, and the picture is NOT lost: a copy is on this
+        // phone and the next peer-link session hands it over. Reported as a
+        // success with `queued` set rather than as an error, because there is
+        // nothing for the user to retry and the row genuinely did something.
+        return { ok: true, success: true, name, queued: true };
+    }
+    return { ok: false, success: false, error: routed.error || 'Wallpaper upload failed.' };
 }
 
 function describeError(error: unknown): string {

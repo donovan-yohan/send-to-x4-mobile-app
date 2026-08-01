@@ -10,8 +10,17 @@
  * Bindings expected (see wrangler.jsonc / README.md):
  *   MAILBOX_KV   KV namespace       — one id pointer + at most two frames per box,
  *                                     plus one book manifest and at most
- *                                     MAX_BOOKS epub blobs when books are used
- *   WRITE_TOKEN  secret (string)    — bearer token for /publish, /status, /books
+ *                                     MAX_BOOKS epub blobs when books are used,
+ *                                     plus one wallpaper manifest and at most
+ *                                     MAX_WALLPAPERS BMP blobs when wallpapers are
+ *   WRITE_TOKEN  secret (string)    — bearer token for /publish, /status, /books,
+ *                                     /wallpaper
+ *
+ * NOTHING HERE KNOWS THE ROUTE NAMES. The per-route body cap and the
+ * auth-before-buffering rule are both decided by `core.js`
+ * (`requestBodyLimit` + `writeAuthPreflight`), so `POST /wallpaper` was picked
+ * up by this adapter without a line changing: its 4 MiB cap is above
+ * MAX_REQUEST_BODY_BYTES, which is the only predicate below.
  */
 
 import { MAX_REQUEST_BODY_BYTES, handleRequest, requestBodyLimit, writeAuthPreflight } from './core.js';
@@ -46,11 +55,13 @@ import { MAX_REQUEST_BODY_BYTES, handleRequest, requestBodyLimit, writeAuthPrefl
  * it; KV will not honour it.
  *
  * NO `stat`/`getRange` HERE, deliberately. Those are the optional half of the
- * store contract and KV has no ranged read — a partial book fetch would still
- * pull the whole value, so implementing them would only hide that cost. The core
- * therefore takes its fetch-once-and-slice path on Workers, which is correct but
- * means one ranged request costs one full value read. That is also why
- * MAX_BOOK_BYTES is 24 MiB rather than 30 MB: it is what KV can hold at all.
+ * store contract and KV has no ranged read — a partial book or wallpaper fetch
+ * would still pull the whole value, so implementing them would only hide that
+ * cost. The core therefore takes its fetch-once-and-slice path on Workers, which
+ * is correct but means one ranged request costs one full value read. That is
+ * also why MAX_BOOK_BYTES is 24 MiB rather than 30 MB: it is what KV can hold at
+ * all. MAX_WALLPAPER_BYTES (4 MiB) is far enough under that ceiling that a
+ * wallpaper resume is cheap by comparison.
  */
 function kvStore(kv) {
     return {

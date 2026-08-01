@@ -35,12 +35,17 @@ import org.json.JSONObject
  *         "queuedAt": 1753900000000 },
  *       { "id": "01JR...", "kind": "book", "filename": "Piranesi.epub", "bytes": 402118,
  *         "bodyPath": "/data/user/0/pkg/files/outbox/01JR.epub",
- *         "queuedAt": 1753900100000, "deliveredAt": 1753900200000 }
+ *         "queuedAt": 1753900100000, "deliveredAt": 1753900200000 },
+ *       { "id": "wp-01JS...", "kind": "wallpaper", "target": "set", "filename": "dune-2026.bmp",
+ *         "bytes": 418992, "bodyPath": "/data/user/0/pkg/files/outbox/wallpaper-wp-01JS.bmp",
+ *         "queuedAt": 1753900300000 }
  *     ]
  *   }
  *
  * ORDER IS PART OF THE CONTRACT: items are NEWEST LAST, so the latest note is the last note entry.
  * Books are emitted newest-first in `books.txt` per section 2, which is this list reversed.
+ * Wallpapers are emitted NEWEST LAST in `wallpaper.txt` — this list's own order — because a reader
+ * applies them one after another and the last one applied wins the `/sleep.bmp` slot.
  *
  * THE MANIFEST MUST BE WRITTEN ATOMICALLY (temp file plus rename). This class re-reads it while the
  * reader is polling, so a partial write would be parsed as garbage. A parse failure is never fatal:
@@ -68,14 +73,24 @@ import org.json.JSONObject
  */
 internal enum class OutboxKind(val wire: String) {
   NOTE("note"),
-  BOOK("book")
+  BOOK("book"),
+  WALLPAPER("wallpaper")
 }
 
 internal data class OutboxItem(
   val id: String,
   val kind: OutboxKind,
-  /** Books always carry one; notes never do. */
+  /** Books and `set` wallpapers always carry one; notes and `primary` wallpapers never do. */
   val filename: String?,
+  /**
+   * Wallpapers only: `primary` for the single `/sleep.bmp` slot, `set` for one entry of the
+   * `/.sleep` rotation. Null for every other kind.
+   *
+   * NEVER DEFAULTED. An entry whose target cannot be read is DROPPED rather than guessed into
+   * `primary`, because `primary` overwrites the one file the firmware prefers over everything else
+   * and a wrong guess replaces a sleep screen the user never asked to replace.
+   */
+  val target: String?,
   /** The file's ACTUAL length, already checked against the manifest's `bytes`. */
   val bytes: Long,
   val body: File,
@@ -101,6 +116,9 @@ internal data class OutboxSnapshot(
   val books: List<OutboxItem>
     get() = items.filter { it.kind == OutboxKind.BOOK }
 
+  val wallpapers: List<OutboxItem>
+    get() = items.filter { it.kind == OutboxKind.WALLPAPER }
+
   val pending: Int
     get() = items.count { !it.delivered }
 
@@ -117,6 +135,10 @@ internal data class OutboxSnapshot(
   fun note(id: String): OutboxItem? = items.firstOrNull { it.kind == OutboxKind.NOTE && it.id == id }
 
   fun book(id: String): OutboxItem? = items.firstOrNull { it.kind == OutboxKind.BOOK && it.id == id }
+
+  /** Exact id lookup, including delivered items, for the reason [book] includes them. */
+  fun wallpaper(id: String): OutboxItem? =
+    items.firstOrNull { it.kind == OutboxKind.WALLPAPER && it.id == id }
 
   /**
    * Local `books.txt` lines, NEWEST FIRST (section 2), without their terminating LF.
@@ -135,6 +157,40 @@ internal data class OutboxSnapshot(
     books.filter { !it.delivered }.reversed().map { item ->
       item.id + " " + item.bytes + " " + (item.filename ?: "")
     }
+
+  /**
+   * Local `wallpaper.txt` lines, NEWEST LAST, without their terminating LF.
+   * `{id} {bytes} {target} {filename}` with '-' in the filename position for a primary.
+   *
+   * NEWEST LAST IS THE OPPOSITE OF [bookLines] AND THAT IS THE POINT. Books are a set the reader
+   * picks from; wallpapers are APPLIED, one after another, and the last one applied wins the
+   * `/sleep.bmp` slot. A reader that walks this list in order therefore finishes on the newest
+   * primary, which is what the user last asked for. Reversing this would leave the panel showing
+   * the OLDEST picture in the queue.
+   *
+   * ONLY THE LAST PENDING PRIMARY IS OFFERED. The queue can hold several (a JS side collapse exists
+   * but is best effort, and a merge with the remote manifest can reintroduce one), and every extra
+   * one is a whole BMP the reader pulls inside a battery budgeted window purely to overwrite it a
+   * window later. Rotation entries are all kept: each is a distinct file the user chose to add.
+   *
+   * DELIVERED ITEMS ARE OMITTED, exactly as in [bookLines] and [latestNote], while [wallpaper]
+   * still answers for them so an in flight Range resume keeps its body.
+   */
+  fun wallpaperLines(): List<String> {
+    val pending = wallpapers.filter { !it.delivered }
+    val lastPrimaryIndex = pending.indexOfLast { it.target == ProxyContract.WALLPAPER_TARGET_PRIMARY }
+    val out = ArrayList<String>(pending.size)
+    for ((index, item) in pending.withIndex()) {
+      if (item.target == ProxyContract.WALLPAPER_TARGET_PRIMARY && index != lastPrimaryIndex) continue
+      val name = if (item.target == ProxyContract.WALLPAPER_TARGET_SET) {
+        item.filename ?: ProxyContract.WALLPAPER_NO_FILENAME
+      } else {
+        ProxyContract.WALLPAPER_NO_FILENAME
+      }
+      out.add(item.id + " " + item.bytes + " " + item.target + " " + name)
+    }
+    return out
+  }
 
   companion object {
     fun empty(error: String?): OutboxSnapshot =
@@ -282,6 +338,7 @@ internal class LocalOutbox(
     val kind = when (stringField(obj, "kind")?.lowercase(Locale.ROOT)) {
       OutboxKind.NOTE.wire -> OutboxKind.NOTE
       OutboxKind.BOOK.wire -> OutboxKind.BOOK
+      OutboxKind.WALLPAPER.wire -> OutboxKind.WALLPAPER
       else -> return null
     }
 
@@ -300,13 +357,35 @@ internal class LocalOutbox(
     if (actual != declared) return null
 
     val filename = stringField(obj, "filename")
-    if (kind == OutboxKind.NOTE) {
-      // Exactly one frame, or the firmware downloads it over a battery budgeted window and then
-      // discards it for being the wrong size.
-      if (actual != ProxyContract.NOTE_FRAME_BYTES) return null
-    } else {
-      if (filename == null || !isValidBookFilename(filename)) return null
-      if (actual > ProxyContract.MAX_BOOK_BYTES) return null
+    var target: String? = null
+    when (kind) {
+      OutboxKind.NOTE ->
+        // Exactly one frame, or the firmware downloads it over a battery budgeted window and then
+        // discards it for being the wrong size.
+        if (actual != ProxyContract.NOTE_FRAME_BYTES) return null
+
+      OutboxKind.BOOK -> {
+        if (filename == null || !isValidBookFilename(filename)) return null
+        if (actual > ProxyContract.MAX_BOOK_BYTES) return null
+      }
+
+      OutboxKind.WALLPAPER -> {
+        // ABSENT OR UNKNOWN TARGET IS A DROPPED ENTRY, never a default. See OutboxItem.target.
+        val declaredTarget = stringField(obj, "target")?.lowercase(Locale.ROOT)
+        if (declaredTarget != ProxyContract.WALLPAPER_TARGET_PRIMARY &&
+          declaredTarget != ProxyContract.WALLPAPER_TARGET_SET
+        ) {
+          return null
+        }
+        // A rotation entry IS its filename; a primary has none, and one supplied anyway is
+        // discarded rather than carried, so the line this produces cannot describe a file the
+        // reader would create in the wrong place.
+        if (declaredTarget == ProxyContract.WALLPAPER_TARGET_SET) {
+          if (filename == null || !isValidWallpaperFilename(filename)) return null
+        }
+        if (actual > ProxyContract.MAX_WALLPAPER_BYTES) return null
+        target = declaredTarget
+      }
     }
 
     val queuedAt = obj.optLong("queuedAt", 0L)
@@ -315,7 +394,12 @@ internal class LocalOutbox(
     return OutboxItem(
       id = id,
       kind = kind,
-      filename = if (kind == OutboxKind.BOOK) filename else null,
+      filename = when {
+        kind == OutboxKind.BOOK -> filename
+        kind == OutboxKind.WALLPAPER && target == ProxyContract.WALLPAPER_TARGET_SET -> filename
+        else -> null
+      },
+      target = target,
       bytes = actual,
       body = body,
       queuedAt = queuedAt,
@@ -434,6 +518,33 @@ internal class LocalOutbox(
       }
       return true
     }
+
+    /**
+     * The wallpaper half of [isValidBookFilename]: the same printable ASCII, no CR or LF, no path
+     * separator, no leading dot, no FAT reserved character and no quote, at most 120 characters.
+     *
+     * TWO DIFFERENCES, both from the line format rather than from the filesystem:
+     *   - `.bmp`, not `.epub`. The firmware scans `/.sleep` for that extension, so a name without
+     *     it is a file the reader writes and never looks at again.
+     *   - A bare '-' is REFUSED. A `wallpaper.txt` line puts '-' in the filename position for a
+     *     primary, so an entry actually named '-' would be indistinguishable from "no name" and
+     *     would be applied to `/sleep.bmp` instead of the rotation.
+     */
+    fun isValidWallpaperFilename(name: String): Boolean {
+      if (name.isEmpty() || name.length > ProxyContract.WALLPAPER_FILENAME_MAX_LEN) return false
+      if (name.startsWith(".")) return false
+      if (name == ProxyContract.WALLPAPER_NO_FILENAME) return false
+      if (!name.lowercase(Locale.ROOT).endsWith(".bmp")) return false
+      for (c in name) {
+        if (c.code < 0x20 || c.code > 0x7E) return false
+        if (c == '/' || c == '\\' || c == '"' || c == '*' || c == ':' ||
+          c == '<' || c == '>' || c == '?' || c == '|'
+        ) {
+          return false
+        }
+      }
+      return true
+    }
   }
 }
 
@@ -441,9 +552,22 @@ internal class LocalOutbox(
 // Which contract endpoint a forwardable target names
 // -------------------------------------------------------------------------------------------
 
-internal enum class MailboxEndpoint { LATEST, FRAME, BOOKS_MANIFEST, BOOK_BODY, OTHER }
+internal enum class MailboxEndpoint {
+  LATEST,
+  FRAME,
+  BOOKS_MANIFEST,
+  BOOK_BODY,
+  WALLPAPER_MANIFEST,
+  WALLPAPER_BODY,
+  OTHER
+}
 
-internal data class MailboxTarget(val endpoint: MailboxEndpoint, val bookId: String?)
+/**
+ * [itemId] is the `{id}` segment for a BOOK_BODY or a WALLPAPER_BODY and null otherwise. One field
+ * rather than two: the two endpoints never coexist in one request, and a second nullable would make
+ * "which one is set" a thing every caller has to reason about.
+ */
+internal data class MailboxTarget(val endpoint: MailboxEndpoint, val itemId: String?)
 
 /**
  * Classifies a forwardable path by its TAIL, never by its head.
@@ -465,14 +589,28 @@ internal object MailboxPaths {
     if (path.endsWith(ProxyContract.BOOKS_SUFFIX)) {
       return MailboxTarget(MailboxEndpoint.BOOKS_MANIFEST, null)
     }
-    val marker = path.lastIndexOf(ProxyContract.BOOK_PATH_MARKER)
-    if (marker >= 0) {
-      val id = path.substring(marker + ProxyContract.BOOK_PATH_MARKER.length)
-      if (id.isNotEmpty() && id.indexOf('/') < 0 && LocalOutbox.isValidId(id)) {
-        return MailboxTarget(MailboxEndpoint.BOOK_BODY, id)
-      }
+    // BEFORE the body markers, deliberately: `/wallpaper.txt` is the manifest, not a body whose id
+    // happens to read like one. The two cannot actually collide (a path ending `/wallpaper.txt`
+    // contains no `/wallpaper/`), but the ordering is what makes that independent of the id charset.
+    if (path.endsWith(ProxyContract.WALLPAPER_SUFFIX)) {
+      return MailboxTarget(MailboxEndpoint.WALLPAPER_MANIFEST, null)
+    }
+    idAfter(path, ProxyContract.BOOK_PATH_MARKER)?.let {
+      return MailboxTarget(MailboxEndpoint.BOOK_BODY, it)
+    }
+    idAfter(path, ProxyContract.WALLPAPER_PATH_MARKER)?.let {
+      return MailboxTarget(MailboxEndpoint.WALLPAPER_BODY, it)
     }
     return MailboxTarget(MailboxEndpoint.OTHER, null)
+  }
+
+  /** The single trailing segment after `marker`, or null when there is no usable id there. */
+  private fun idAfter(path: String, marker: String): String? {
+    val at = path.lastIndexOf(marker)
+    if (at < 0) return null
+    val id = path.substring(at + marker.length)
+    if (id.isEmpty() || id.indexOf('/') >= 0 || !LocalOutbox.isValidId(id)) return null
+    return id
   }
 }
 

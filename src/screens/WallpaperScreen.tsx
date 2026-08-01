@@ -12,6 +12,28 @@
  *   ROTATION  /.sleep/<name>.bmp. The firmware picks one at random on sleep and
  *             avoids repeating the most recent ones.
  *
+ * ---------------------------------------------------------------------------
+ * THREE ROADS, AND WHY THE BUTTONS NO LONGER GO GREY
+ * ---------------------------------------------------------------------------
+ * This was the last direct-only screen in the app. Setting a sleep screen meant
+ * PUTing a BMP at the reader's own HTTP API, so both destination buttons were
+ * disabled whenever the reader was asleep — which is almost always, because it
+ * sleeps with its radio off — and a client phone could not change one at all.
+ * The screen said "Reader asleep" under two grey buttons, which was TRUE and
+ * completely useless: it named a precondition the user cannot satisfy on demand.
+ *
+ * `wallpaper_sender.routeWallpaperSend` gave the payload the same three roads
+ * notes and books already had (reader / mailbox / peer-link handover), so the
+ * gate here is now `deliverability.wallpaperRoute !== 'none'`: if ANY road
+ * exists the action runs and the screen says which road it took. Only a phone
+ * with nothing configured anywhere still disables anything.
+ *
+ * TWO LISTS, DELIBERATELY. "Waiting to sync" is what the MAILBOX holds (what
+ * the reader has not collected); "Rotation" is what is ON THE CARD, read back
+ * from the reader. They cannot be merged, because nothing reports delivery back
+ * — the contract has no acks — so an item leaves the first when the reader takes
+ * it and appears in the second only once the user can reach the reader to look.
+ *
  * Both go out through `wallpaper_sender`, which owns the paths; this file never
  * builds a device path of its own. The only string it contributes is the
  * rotation ENTRY NAME, and even that is only a readable STEM — the sender's own
@@ -117,17 +139,25 @@ import {
     rgbaToPngDataUri,
     rgbaToThumbnailBase64,
 } from '../services/preview_png';
-import { isHost } from '../services/role';
+import { getRole, isHost } from '../services/role';
 import { getCurrentIp } from '../services/settings';
+import { useDeliverability } from '../services/useDeliverability';
+import {
+    deleteMailboxWallpaper,
+    listMailboxWallpapers,
+    type MailboxWallpaper,
+} from '../services/mailbox_client';
 import {
     deleteSleepSetEntry,
     listSleepSet,
+    routeWallpaperSend,
     sanitizeSleepSetName,
-    sendWallpaperBmp,
     verifyPrimaryWallpaper,
     SLEEP_MODE_HINT,
     SLEEP_ROOT_FILENAME,
     SLEEP_SET_DIR,
+    WALLPAPER_HANDOVER_LANDING_CLAUSE,
+    WALLPAPER_MAILBOX_LANDING_CLAUSE,
 } from '../services/wallpaper_sender';
 import { createLock, type WithLock } from '../utils/lock';
 
@@ -336,6 +366,21 @@ export function WallpaperScreen() {
     /** Identified by `rawName` — the name that is unique on the device. */
     const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
+    /**
+     * What the MAILBOX is holding, i.e. what the reader has not collected yet.
+     *
+     * A SECOND LIST, and it has to be: the rotation list below is what is ON THE
+     * CARD, read from the reader, and this is what is ON ITS WAY. Nothing
+     * reports delivery back (the contract has no acks anywhere), so the two
+     * cannot be merged into one honest list — an item leaves this one when the
+     * reader takes it and appears in that one only after the user can reach the
+     * reader to look.
+     */
+    const [queued, setQueued] = useState<MailboxWallpaper[]>([]);
+    const [queueLoading, setQueueLoading] = useState(false);
+    /** Identified by mailbox id, which is unique across the whole box. */
+    const [cancellingId, setCancellingId] = useState<string | null>(null);
+
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -366,16 +411,42 @@ export function WallpaperScreen() {
     /** Ticket for the rotation listing, same staleness rule as the encode. */
     const listRequestRef = useRef(0);
 
+    /** Ticket for the mailbox listing. Separate: the two races are independent. */
+    const queueRequestRef = useRef(0);
+
     const host = settingsLoaded && isHost(settings);
     /**
-     * DIRECT-ONLY, and legitimately so: writing a sleep screen means PUTing a
-     * BMP at the reader's own HTTP API. There is no mailbox road for it and no
-     * outbox to park it in, which is why this screen keeps a hard gate where
-     * Compose lost one — the gate here is TRUE, it just no longer shouts.
+     * THE READER-IS-AWAKE QUESTION, and it now gates ONLY the two things that
+     * genuinely need an awake reader: LISTING `/.sleep` and DELETING from it.
      *
-     * Shared hook, so Wallpaper, Device and History all read one value.
+     * Both are reads/writes against the reader's own file API with no second
+     * road — there is no "list the rotation through the mailbox", because the
+     * mailbox holds what is WAITING and the card holds what ARRIVED, and nothing
+     * reports the latter back. So this stays, and it stays quiet.
+     *
+     * IT NO LONGER GATES THE SEND. See `wallpaperRoute` below.
      */
     const { available: connected } = useDirectConnectionRequired();
+
+    /**
+     * THE FIX THIS SCREEN EXISTED TO NEED.
+     *
+     * Setting a sleep screen used to be direct-LAN only, so both destination
+     * buttons were greyed out whenever the reader was asleep — which is almost
+     * always, because it sleeps with its radio off. The reader has not changed;
+     * the ROADS have: `routeWallpaperSend` publishes to the mailbox the reader
+     * already polls, and parks a copy in the outbox for a peer-link handover.
+     *
+     * So the gate is now "is there ANY road?" rather than "is the reader awake
+     * right now?", and the difference is the whole point: a button that enqueues
+     * and says so is strictly better than a grey one that says the reader is
+     * asleep, which the user already knew and cannot change.
+     *
+     * `mailboxReady` is read only to WORD the caption — the routing decision
+     * itself belongs to `wallpaperRoute`, which is derived by the same module
+     * the send routes on, so the screen cannot promise a road the send refuses.
+     */
+    const { wallpaperRoute, mailboxReady } = useDeliverability();
 
     // ── Timers ──────────────────────────────────────────────────────
 
@@ -569,10 +640,99 @@ export function WallpaperScreen() {
         }
     }, [connected, settings]);
 
+    // ── Mailbox queue ───────────────────────────────────────────────
+
+    /**
+     * What is waiting in the mailbox for the reader to collect.
+     *
+     * Reads `/status` through `listMailboxWallpapers`, which is authenticated —
+     * so "can I see it" and "can I write it" fail together, rather than showing
+     * a healthy queue on a box this phone cannot publish to.
+     *
+     * A FAILURE IS AN EMPTY LIST, not an error banner. This section is
+     * informational, the send it describes has already been reported, and a
+     * second red box for a listing the user did not ask for would be noise.
+     */
+    const loadMailboxQueue = useCallback(async () => {
+        const requestId = ++queueRequestRef.current;
+
+        if (!mailboxReady) {
+            setQueued([]);
+            setQueueLoading(false);
+            return;
+        }
+
+        setQueueLoading(true);
+        try {
+            const result = await listMailboxWallpapers(
+                settings.mailboxUrl ?? '',
+                settings.mailboxWriteToken ?? ''
+            );
+            if (requestId !== queueRequestRef.current) return;
+            // NEWEST FIRST for a HUMAN, which is what `/status` already gives us.
+            //
+            // THIS USED TO `.reverse()` AND THAT WAS BACKWARDS. The reasoning was
+            // "wallpaper.txt is newest last, so flip it" — but this list does not
+            // come from wallpaper.txt. `listMailboxWallpapers` reads `/status`,
+            // which serves the STORED index, and core.js stores newest first
+            // (publish does `[entry, ...kept]`); only `renderWallpaperManifest`
+            // reverses, and only for the firmware's wire. Flipping here put the
+            // OLDEST queued picture at the top of a list whose whole purpose is
+            // showing the user the thing they just did.
+            setQueued(result.success ? result.wallpapers : []);
+        } catch (error) {
+            if (requestId !== queueRequestRef.current) return;
+            console.warn('[WallpaperScreen] Failed to list the mailbox queue:', error);
+            setQueued([]);
+        } finally {
+            if (requestId === queueRequestRef.current) setQueueLoading(false);
+        }
+    }, [mailboxReady, settings.mailboxUrl, settings.mailboxWriteToken]);
+
+    const handleCancelQueued = useCallback(
+        (item: MailboxWallpaper) => {
+            const label =
+                item.target === 'primary' ? 'the queued sleep screen' : `"${item.filename}"`;
+            Alert.alert(
+                'Cancel delivery',
+                // Says what it CANNOT do, because the alternative is a promise
+                // this contract cannot keep: there is no reverse channel, so a
+                // reader that already collected it keeps its copy.
+                `Stop ${label} from reaching the reader? A reader that already collected it keeps it.`,
+                [
+                    { text: 'Keep', style: 'cancel' },
+                    {
+                        text: 'Cancel delivery',
+                        style: 'destructive',
+                        onPress: async () => {
+                            setCancellingId(item.id);
+                            try {
+                                const result = await deleteMailboxWallpaper(
+                                    settings.mailboxUrl ?? '',
+                                    settings.mailboxWriteToken ?? '',
+                                    item.id
+                                );
+                                if (result.success) {
+                                    setQueued(prev => prev.filter(row => row.id !== item.id));
+                                } else {
+                                    Alert.alert('Error', result.error ?? 'Could not cancel it.');
+                                }
+                            } finally {
+                                setCancellingId(null);
+                            }
+                        },
+                    },
+                ]
+            );
+        },
+        [settings.mailboxUrl, settings.mailboxWriteToken]
+    );
+
     useFocusEffect(
         useCallback(() => {
             void loadSet();
-        }, [loadSet])
+            void loadMailboxQueue();
+        }, [loadSet, loadMailboxQueue])
     );
 
     /** Pull-to-refresh. Separate from the focus load — see `refreshing`. */
@@ -580,12 +740,12 @@ export function WallpaperScreen() {
         void (async () => {
             setRefreshing(true);
             try {
-                await loadSet();
+                await Promise.all([loadSet(), loadMailboxQueue()]);
             } finally {
                 setRefreshing(false);
             }
         })();
-    }, [loadSet]);
+    }, [loadSet, loadMailboxQueue]);
 
     const handleDeleteEntry = useCallback(
         (entry: SleepSetEntry) => {
@@ -635,12 +795,16 @@ export function WallpaperScreen() {
 
     const handleUpload = useCallback(
         async (target: UploadTarget) => {
-            // KEPT — the user just tapped an upload button — but re-titled off
-            // "Not connected", which frames the reader's normal state as a
-            // fault, and trimmed to the one sentence that is actually true here:
-            // this particular write has no road but the direct one.
-            if (!connected) {
-                Alert.alert('Reader asleep', 'The sleep screen can only be changed with the reader awake.');
+            // THE ONLY REMAINING HARD REFUSAL, and it is about SETUP, not about
+            // the reader. 'none' means no road exists at all — no awake reader,
+            // no mailbox, and no serveable base to hand over. Every other state
+            // enqueues, so this alert is the one case where the tap genuinely
+            // cannot start anything.
+            if (wallpaperRoute === 'none') {
+                Alert.alert(
+                    'No way to deliver this yet',
+                    'Add a mailbox URL in Settings, or wake the reader and join its Wi-Fi.'
+                );
                 return;
             }
 
@@ -676,16 +840,35 @@ export function WallpaperScreen() {
                 target === 'primary' ? 'Setting sleep screen...' : 'Adding to rotation...'
             );
 
-            // sendWallpaperBmp follows the repo sender convention: it never
-            // throws, every failure comes back as { success: false, error }.
-            const result = await sendWallpaperBmp(
-                getCurrentIp(settings),
+            // routeWallpaperSend follows the repo sender convention: it never
+            // throws, every failure comes back as { success: false, error }. It
+            // tries the reader first when there is any point, falls back to the
+            // mailbox, and parks a copy in the outbox when neither worked.
+            const result = await routeWallpaperSend(
+                {
+                    role: getRole(settings),
+                    ip: getCurrentIp(settings),
+                    mailboxUrl: settings.mailboxUrl,
+                    mailboxWriteToken: settings.mailboxWriteToken,
+                },
                 built.bmp,
                 spec,
                 percent => setProgress(percent)
             );
 
-            if (result.success) {
+            if (result.success && result.route === 'mailbox') {
+                // NOT "updated". The picture is in a box the reader collects on
+                // its own schedule, so the panel does not change until it next
+                // syncs — which can be hours. Saying otherwise here is the lie
+                // the whole progressive model exists to stop telling.
+                finishUpload();
+                showToast(
+                    target === 'primary'
+                        ? `Sleep screen queued — ${WALLPAPER_MAILBOX_LANDING_CLAUSE} ✓`
+                        : `${rotationName} queued — ${WALLPAPER_MAILBOX_LANDING_CLAUSE} ✓`
+                );
+                void loadMailboxQueue();
+            } else if (result.success) {
                 finishUpload();
 
                 if (target === 'set') {
@@ -713,6 +896,20 @@ export function WallpaperScreen() {
                         showToast('Sleep screen updated ✓');
                     }
                 }
+            } else if (result.queuedId) {
+                // NOTHING DELIVERED, AND THE PICTURE IS NOT LOST. The auto-arm
+                // put a copy on this phone's disk; the next Sync-with-reader
+                // hands it over with no internet on either side. Reported as a
+                // SUCCESS banner rather than an error, because from the user's
+                // side something did happen and there is nothing to retry — the
+                // transport's own message would be noise about a road that is no
+                // longer the one being taken.
+                finishUpload();
+                showToast(
+                    target === 'primary'
+                        ? `Sleep screen ${WALLPAPER_HANDOVER_LANDING_CLAUSE} ✓`
+                        : `${rotationName} ${WALLPAPER_HANDOVER_LANDING_CLAUSE} ✓`
+                );
             } else {
                 const message = result.error || 'Upload failed';
                 failUpload(message);
@@ -722,12 +919,13 @@ export function WallpaperScreen() {
             setUploading(null);
         },
         [
-            connected,
+            wallpaperRoute,
             settings,
             picked,
             cancelScheduledPreview,
             regenerate,
             loadSet,
+            loadMailboxQueue,
             showToast,
             startUpload,
             setProgress,
@@ -771,7 +969,34 @@ export function WallpaperScreen() {
     }
 
     const busy = uploading !== null;
-    const canUpload = preview !== null && connected && !busy && !encoding;
+    /**
+     * PROGRESSIVE, NOT BINARY. The only things that can still disable a
+     * destination button are things the user can act on right now — no picture
+     * yet, a render in flight, a send already running — plus the one genuine
+     * dead end, `wallpaperRoute === 'none'` (nothing configured anywhere).
+     *
+     * `connected` is deliberately NOT in this expression. That is the whole
+     * change: an asleep reader used to grey both buttons out, and an asleep
+     * reader is the normal state of this product.
+     */
+    const canUpload = preview !== null && wallpaperRoute !== 'none' && !busy && !encoding;
+
+    /**
+     * What the buttons are about to do, in one line, or null when the outcome is
+     * the obvious one (the reader is awake and will show it in seconds).
+     *
+     * Said BEFORE the tap, not after: "it will wait in the mailbox" is exactly
+     * the information that makes an enabled button honest rather than a
+     * surprise, and it is the sentence the greyed-out button never got to say.
+     */
+    const routeNote =
+        wallpaperRoute === 'mailbox'
+            ? `Reader asleep — this ${WALLPAPER_MAILBOX_LANDING_CLAUSE}.`
+            : wallpaperRoute === 'handover-only'
+                ? `Reader asleep — this ${WALLPAPER_HANDOVER_LANDING_CLAUSE}.`
+                : wallpaperRoute === 'none'
+                    ? 'No mailbox set up, and the reader is not answering. Add a mailbox URL in Settings.'
+                    : null;
 
     const emptyPreviewText = !picked
         ? 'Pick an image to see how it lands on the panel.'
@@ -947,13 +1172,13 @@ export function WallpaperScreen() {
                     />
                 </View>
 
-                {/* WAS: "Not connected — join the reader's WiFi to change what it
-                    shows while it sleeps." Two words now, no colour, and only
-                    because a disabled button with no explanation at all reads as
-                    a bug. The buttons above are already grey. */}
-                {!connected ? (
-                    <Text style={styles.quietNote}>{READER_ASLEEP_CAPTION}</Text>
-                ) : null}
+                {/* WAS: `READER_ASLEEP_CAPTION` under two greyed-out buttons.
+                    Both of those are gone. The buttons are LIVE whenever any
+                    road exists, and this line says which road the tap will take
+                    — which is the thing the old caption could not say, because
+                    when it was written there was only one road and it was
+                    closed. Still one line, still no colour. */}
+                {routeNote ? <Text style={styles.quietNote}>{routeNote}</Text> : null}
 
                 {/* Device-side prerequisite. Not settable over the wire today, so
                     the wording is the sender's single literal (SLEEP_MODE_HINT)
@@ -966,6 +1191,65 @@ export function WallpaperScreen() {
                     <Text style={styles.noticeHeading}>On the reader</Text>
                     <Text style={styles.noticeText}>{SLEEP_MODE_HINT}</Text>
                 </View>
+
+                {/* WAITING IN THE MAILBOX — what the reader has not collected yet.
+                    Rendered ONLY when there is something in it: a permanently
+                    visible "0 waiting" row would be a section about nothing on
+                    the overwhelmingly common path (the reader was awake, or
+                    there is no mailbox at all). */}
+                {queued.length > 0 ? (
+                    <View style={styles.section}>
+                        <View style={styles.sectionHeader}>
+                            <Text style={styles.listTitle}>Waiting to sync ({queued.length})</Text>
+                            <TouchableOpacity
+                                onPress={() => void loadMailboxQueue()}
+                                disabled={queueLoading}
+                            >
+                                <Text
+                                    style={[
+                                        styles.linkText,
+                                        queueLoading && styles.linkTextDisabled,
+                                    ]}
+                                >
+                                    ↻ Refresh
+                                </Text>
+                            </TouchableOpacity>
+                        </View>
+                        {queued.map(item => (
+                            <View key={item.id} style={styles.fileItemContainer}>
+                                <View style={styles.fileItem}>
+                                    <View style={styles.fileInfo}>
+                                        <Text style={styles.fileName} numberOfLines={1}>
+                                            {item.target === 'primary'
+                                                ? `Sleep screen (/${SLEEP_ROOT_FILENAME})`
+                                                : item.filename}
+                                        </Text>
+                                        <Text style={styles.fileMeta}>
+                                            {item.target === 'primary'
+                                                ? `Pinned · ${formatSize(item.bytes)}`
+                                                : `Rotation · ${formatSize(item.bytes)}`}
+                                        </Text>
+                                    </View>
+                                    <TouchableOpacity
+                                        style={styles.deleteButton}
+                                        onPress={() => handleCancelQueued(item)}
+                                        disabled={cancellingId !== null}
+                                        accessibilityLabel="Cancel this delivery"
+                                    >
+                                        {cancellingId === item.id ? (
+                                            <ActivityIndicator
+                                                size="small"
+                                                color={theme.colors.danger}
+                                            />
+                                        ) : (
+                                            <BinIcon size={18} color={theme.colors.danger} />
+                                        )}
+                                    </TouchableOpacity>
+                                </View>
+                            </View>
+                        ))}
+                    </View>
+                ) : null}
 
                 {/* Rotation manager */}
                 <View style={styles.section}>

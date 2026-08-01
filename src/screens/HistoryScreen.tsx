@@ -74,11 +74,16 @@ import {
 import { describeKind, describeStatus, formatRelativeTime } from '../services/history_view';
 import { pngBase64ToDataUri } from '../services/preview_png';
 import { canPromoteRecord, promoteRecordToWallpaper } from '../services/promote';
-import { isHost } from '../services/role';
+import { getRole, isHost } from '../services/role';
 import { getCurrentIp } from '../services/settings';
-import { SLEEP_MODE_HINT, SLEEP_SET_DIR } from '../services/wallpaper_sender';
+import {
+    SLEEP_MODE_HINT,
+    SLEEP_SET_DIR,
+    WALLPAPER_HANDOVER_LANDING_CLAUSE,
+    WALLPAPER_MAILBOX_LANDING_CLAUSE,
+} from '../services/wallpaper_sender';
+import { useDeliverability } from '../services/useDeliverability';
 import { Icon, type IconName } from '../components/icons';
-import { useDirectConnectionRequired } from '../components/ConnectionBanner';
 import { useTabBarInset, useTheme, type Theme } from '../theme';
 import { NOTE_SOURCE_FILE_PREFIX } from './ComposeScreen';
 
@@ -228,16 +233,16 @@ export function HistoryScreen() {
 
     const canPromote = settingsLoaded && isHost(settings);
     /**
-     * Promoting writes a BMP over the reader's HTTP API — direct-only, no
-     * mailbox road, so this genuinely is the `connected` question and not the
-     * deliverability one.
+     * PROMOTE IS NO LONGER DIRECT-ONLY, so it no longer asks `connected`.
      *
-     * Taken from the SHARED hook rather than off `connectionStatus` so this
-     * screen ages the observation exactly as Device and Wallpaper do. See the
-     * note on `useDirectConnectionRequired` for why that is the un-decayed
-     * `connected` and not `directNow`.
+     * It used to: promoting wrote a BMP over the reader's own HTTP API and there
+     * was no other road, so the picture icon on every row went grey whenever the
+     * reader was asleep — which is almost always. `routeWallpaperSend` gave the
+     * payload the mailbox and the peer-link handover, so the question this
+     * screen asks is now "is there ANY road?", answered by the same module the
+     * send routes on. `'none'` is the only state that still disables anything.
      */
-    const { available: connected } = useDirectConnectionRequired();
+    const { wallpaperRoute } = useDeliverability();
 
     const handlePromote = useCallback(
         (record: MessageRecord) => {
@@ -249,7 +254,12 @@ export function HistoryScreen() {
                     // Never throws: an unreadable source picture and a dead
                     // socket both come back as { ok: false, error }.
                     const result = await promoteRecordToWallpaper(
-                        getCurrentIp(settings),
+                        {
+                            role: getRole(settings),
+                            ip: getCurrentIp(settings),
+                            mailboxUrl: settings.mailboxUrl,
+                            mailboxWriteToken: settings.mailboxWriteToken,
+                        },
                         record,
                         percent => setPromoteProgress(percent)
                     );
@@ -260,7 +270,18 @@ export function HistoryScreen() {
                             // seen, so the precondition rides along with the
                             // success — in wallpaper_sender's canonical wording,
                             // so this tab cannot drift from the Wallpaper tab.
-                            message: `Added to ${SLEEP_SET_DIR} as ${result.name}. ${SLEEP_MODE_HINT}`,
+                            //
+                            // AND THE ROAD IS NAMED. "Added to /.sleep" is only
+                            // true when the reader took the bytes; on the mailbox
+                            // and handover roads it has not seen them yet, and
+                            // saying otherwise is the exact lie the progressive
+                            // model exists to stop telling.
+                            message:
+                                result.route === 'mailbox'
+                                    ? `${result.name} queued — ${WALLPAPER_MAILBOX_LANDING_CLAUSE}. ${SLEEP_MODE_HINT}`
+                                    : result.queued
+                                        ? `${result.name} ${WALLPAPER_HANDOVER_LANDING_CLAUSE}. ${SLEEP_MODE_HINT}`
+                                        : `Added to ${SLEEP_SET_DIR} as ${result.name}. ${SLEEP_MODE_HINT}`,
                         });
                     } else {
                         showBanner({
@@ -362,12 +383,14 @@ export function HistoryScreen() {
                 busy={busyId === item.id}
                 promoting={promotingId === item.id}
                 showPromote={canPromote}
-                promoteEnabled={canPromote && connected && canPromoteRecord(item) && !busy}
+                promoteEnabled={
+                    canPromote && wallpaperRoute !== 'none' && canPromoteRecord(item) && !busy
+                }
                 onDelete={handleDelete}
                 onPromote={handlePromote}
             />
         ),
-        [now, busyId, promotingId, canPromote, connected, busy, handleDelete, handlePromote]
+        [now, busyId, promotingId, canPromote, wallpaperRoute, busy, handleDelete, handlePromote]
     );
 
     // The empty slot carries the first-load spinner too, so the header (and its

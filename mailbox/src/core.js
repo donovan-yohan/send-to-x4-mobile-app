@@ -111,6 +111,75 @@
  * content rather than rely on it.
  *
  * ---------------------------------------------------------------------------
+ * WALLPAPERS RIDE THE SAME MAILBOX (additive — no note or book key changes)
+ * ---------------------------------------------------------------------------
+ * Wallpaper delivery used to be direct-LAN only (the app pushed a BMP straight
+ * at the reader's `/sleep.bmp` or `/.sleep/`), which means it only worked while
+ * the phone and the reader were on the same network AND the reader was awake.
+ * This route makes a sleep screen travel the way notes and books already do:
+ * published from anywhere, collected on the reader's own sync windows.
+ *
+ *   FIRMWARE READS — no auth (the boxId is the capability, as above):
+ *     GET  {base}/wallpaper.txt      -> 200 text/plain, ONE LINE PER PENDING
+ *                                       WALLPAPER:
+ *                                         "{id} {bytes} {target} {filename}\n"
+ *                                       `target` is `primary` or `set`;
+ *                                       `filename` is the literal "-" for a
+ *                                       primary (it has none). ZERO-LENGTH body
+ *                                       when nothing is pending.
+ *
+ *                                       NEWEST LAST — the opposite of books.txt,
+ *                                       and deliberately so. A reader applies
+ *                                       these IN THE ORDER IT READS THEM, and
+ *                                       the last write to /sleep.bmp is the one
+ *                                       that sticks; newest-last means a reader
+ *                                       that drains the whole manifest in one
+ *                                       window ENDS on the newest primary.
+ *                                       Newest-first would end on the oldest.
+ *     GET  {base}/wallpaper/{id}     -> 200 image/bmp + `Accept-Ranges: bytes`,
+ *                                       with the SAME single-range 206/416
+ *                                       resume behaviour as /books/{id}. A
+ *                                       1056-long-side 8bpp BMP is ~1.1 MB,
+ *                                       which is several wake windows.
+ *     HEAD {base}/wallpaper/{id}     -> the same headers, no body.
+ *
+ *   APP WRITES — bearer auth:
+ *     POST   {base}/wallpaper        X-Wallpaper-Id: <id>  (NOTE_ID_PATTERN)
+ *                                    X-Wallpaper-Target: primary | set
+ *                                    X-Filename: <name.bmp>
+ *                                        REQUIRED when target=set, IGNORED for
+ *                                        primary (a primary has exactly one
+ *                                        destination, /sleep.bmp, so a name
+ *                                        would be a second source of truth).
+ *                                    body = 8-bit grayscale BMP,
+ *                                           1..MAX_WALLPAPER_BYTES
+ *                                 -> 200 {"ok":true,"id","target","filename",
+ *                                         "bytes"} — `filename` is null for a
+ *                                        primary
+ *                                    401 / 400 / 413 exactly as /books
+ *     DELETE {base}/wallpaper/{id} -> 200 {"ok":true,"id","target","filename"}
+ *                                    404 unknown id
+ *
+ * READER-SIDE APPLICATION, which is why `target` is on the wire at all:
+ *   primary -> write to /sleep.bmp        (the active sleep screen)
+ *   set     -> write to /.sleep/{filename} (the rotation folder)
+ * The reader tracks APPLIED IDS so it never re-downloads one — the same
+ * done-state pattern BookSync uses. There are no server-side acks here either,
+ * for the same reasons spelled out for books.
+ *
+ * PRIMARY SUPERSEDE. A new `primary` REPLACES any earlier primary still in the
+ * index (entry and blob), rather than accumulating. Two pending primaries would
+ * make the reader download ~1.1 MB it is about to overwrite, inside a
+ * battery-budgeted window, to end up exactly where the newest one alone would
+ * have put it. `set` items do not supersede each other: they land in different
+ * files and are all wanted. At most one primary is therefore ever pending, and
+ * that invariant is re-checked on READ so a corrupted index cannot break it.
+ *
+ * ORDERING is the books ordering, for the books reasons: publish writes the
+ * BLOB first and the index second; delete writes the INDEX first and drops the
+ * blob second; GC is last and never fatal.
+ *
+ * ---------------------------------------------------------------------------
  * WHY THE FRAME KEY IS CONTENT-ADDRESSED — read before "simplifying" it
  * ---------------------------------------------------------------------------
  * The reader pairs an id and a frame across TWO SEPARATE HTTP REQUESTS
@@ -166,10 +235,11 @@
  *   get(key)           -> Promise<Uint8Array|null>,
  *   put(key, bytes)    -> Promise<void>,
  *   delete?(key)       -> Promise<void>   // OPTIONAL; absent = frames accumulate
- *   // OPTIONAL PAIR, and only useful for books. Present together or not at all.
- *   // With them a ranged book read touches only the requested window instead of
- *   // materialising the whole 24 MB value; without them (Workers KV has no
- *   // ranged read) the value is fetched once and sliced. Same bytes either way.
+ *   // OPTIONAL PAIR, and only useful for the ranged blob routes (books and
+ *   // wallpapers). Present together or not at all. With them a ranged read
+ *   // touches only the requested window instead of materialising the whole
+ *   // value; without them (Workers KV has no ranged read) the value is fetched
+ *   // once and sliced. Same bytes either way.
  *   stat?(key)                  -> Promise<{bytes: number}|null>,
  *   getRange?(key, start, len)  -> Promise<Uint8Array|null>
  * }
@@ -268,6 +338,64 @@ export const BOOK_FILENAME_MAX_LEN = 120;
 /** What `GET {base}/books/{id}` serves. */
 export const BOOK_CONTENT_TYPE = 'application/epub+zip';
 
+/**
+ * Per-wallpaper hard cap.
+ *
+ * The panel's long side is 1056 px, so a full-bleed 8-bit grayscale BMP is
+ * ~1.1 MB (1056 x 1056 would be 1115136 B of pixel data plus a 1078-byte header
+ * and its palette). 4 MiB therefore leaves ~4x headroom for a larger source or a
+ * padded row stride, while staying FAR under the 25 MiB Workers KV value
+ * ceiling — the same "a body we accept is a body kv.put can store" rule that
+ * sized MAX_BOOK_BYTES, with much more slack because there is no reason for a
+ * sleep screen to approach it.
+ *
+ * ONE constant for both adapters, so a wallpaper that works on the LAN dev
+ * server works on Workers unchanged.
+ */
+export const MAX_WALLPAPER_BYTES = 4 * 1024 * 1024; // 4194304
+
+/**
+ * Pending wallpapers per box. The 9th evicts the OLDEST (index entry and blob).
+ *
+ * Smaller than MAX_BOOKS because the manifest is fetched on every wake window
+ * and because a wallpaper is a thing the reader APPLIES and forgets, not a
+ * library it keeps in sync — a backlog of eight is already more than a reader
+ * can sensibly drain in one window at ~1.1 MB each.
+ */
+export const MAX_WALLPAPERS = 8;
+
+/**
+ * Wallpaper ids share the note/book charset, for the same reason: the id is
+ * echoed verbatim into a wallpaper.txt line and appears in a URL path segment,
+ * so space, tab, CR, LF, `/` and `%` all have to be impossible rather than
+ * escaped. `.` and `..` are rejected on top (see {@link validateWallpaperId}).
+ */
+export const WALLPAPER_ID_MAX_LEN = NOTE_ID_MAX_LEN;
+export const WALLPAPER_ID_PATTERN = NOTE_ID_PATTERN;
+
+/** Same budget and the same reject-never-truncate rule as book filenames. */
+export const WALLPAPER_FILENAME_MAX_LEN = 120;
+
+/** What `GET {base}/wallpaper/{id}` serves. */
+export const WALLPAPER_CONTENT_TYPE = 'image/bmp';
+
+/** Destination on the reader: the active sleep screen, `/sleep.bmp`. */
+export const WALLPAPER_TARGET_PRIMARY = 'primary';
+/** Destination on the reader: the rotation folder, `/.sleep/{filename}`. */
+export const WALLPAPER_TARGET_SET = 'set';
+export const WALLPAPER_TARGETS = Object.freeze([WALLPAPER_TARGET_PRIMARY, WALLPAPER_TARGET_SET]);
+
+/**
+ * The token a manifest line carries in the filename field when there is no
+ * filename (every `primary`).
+ *
+ * A POSITIONAL placeholder, not a name: the line is four space-separated fields
+ * and the parser takes the fourth as "the rest of the line", so the field can
+ * never be empty or the LF would move into it. "-" is safe because a `set`
+ * filename must end in `.bmp` and therefore can never BE "-".
+ */
+export const WALLPAPER_NO_FILENAME = '-';
+
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
@@ -311,6 +439,34 @@ export function booksIndexKey(boxId) {
  */
 export function bookKey(boxId, bookId) {
     return `box:${boxId}:book:${bookId}`;
+}
+
+/**
+ * KV/Map key for a box's pending-wallpaper manifest. Exactly one per box.
+ *
+ * ADDITIVE, exactly like the books index: no note key and no book key changes
+ * shape or meaning when wallpapers arrive.
+ */
+export function wallpapersIndexKey(boxId) {
+    return `box:${boxId}:wallpapers:index`;
+}
+
+/**
+ * KV/Map key for ONE wallpaper's BMP bytes.
+ *
+ * Content-addressed by wallpaper id for the reason frames and books are: the
+ * bytes served are selected BY the id inside one request, so a replica holding
+ * the manifest but not yet the blob can only 404 — never hand out a different
+ * image under this id.
+ *
+ * The dev server's file store maps `:` to `_`, and the id charset excludes `_`,
+ * so that mapping stays injective across all four namespaces:
+ * `box_X_wallpapers_index` cannot be produced by any `wallpaper:{id}` key
+ * (it would need the id `s_index`), and `wallpaper:` never collides with
+ * `book:` / `books:` / `frame:`.
+ */
+export function wallpaperKey(boxId, wallpaperId) {
+    return `box:${boxId}:wallpaper:${wallpaperId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,16 +630,63 @@ export function trimNoteId(raw) {
  * @returns {{ok: true, id: string} | {ok: false, detail: string}}
  */
 export function validateBookId(raw) {
+    return validateMediaId(raw, 'book');
+}
+
+/**
+ * Validate a wallpaper id, from EITHER `X-Wallpaper-Id` or the
+ * `/wallpaper/{id}` path segment. Same function, same charset and the same
+ * dot-only reject as book ids — see {@link validateBookId}.
+ *
+ * @returns {{ok: true, id: string} | {ok: false, detail: string}}
+ */
+export function validateWallpaperId(raw) {
+    return validateMediaId(raw, 'wallpaper');
+}
+
+/**
+ * The shared body of {@link validateBookId} and {@link validateWallpaperId}.
+ *
+ * ONE implementation on purpose: both ids are interpolated into a store key,
+ * both keys become a filesystem path on the dev server, and both are echoed
+ * verbatim into a manifest line. A second copy of this that drifted by one rule
+ * would open a traversal on exactly one of the two routes.
+ */
+function validateMediaId(raw, label) {
     const id = trimNoteId(raw);
-    if (id.length === 0) return { ok: false, detail: 'book id is empty after trimming' };
-    if (id.length > BOOK_ID_MAX_LEN) {
+    if (id.length === 0) return { ok: false, detail: `${label} id is empty after trimming` };
+    if (id.length > NOTE_ID_MAX_LEN) {
         // Rejected, never truncated — same reasoning as note ids: a truncated id
         // still looks valid and collides with every id sharing its prefix.
-        return { ok: false, detail: `book id longer than ${BOOK_ID_MAX_LEN} chars` };
+        return { ok: false, detail: `${label} id longer than ${NOTE_ID_MAX_LEN} chars` };
     }
-    if (!BOOK_ID_PATTERN.test(id)) return { ok: false, detail: 'book id must match [A-Za-z0-9._~-]' };
-    if (/^\.+$/.test(id)) return { ok: false, detail: '"." and ".." are not book ids' };
+    if (!NOTE_ID_PATTERN.test(id)) return { ok: false, detail: `${label} id must match [A-Za-z0-9._~-]` };
+    if (/^\.+$/.test(id)) return { ok: false, detail: `"." and ".." are not ${label} ids` };
     return { ok: true, id };
+}
+
+/**
+ * Validate `X-Wallpaper-Target`. It decides WHERE the reader writes the bytes
+ * (`/sleep.bmp` vs `/.sleep/{filename}`), so an unrecognised value must be a
+ * 400 rather than a default — silently picking one would overwrite a user's
+ * active sleep screen with something they meant to add to the rotation.
+ *
+ * Trimmed and lowercased before matching: the value is a closed two-member
+ * enum, so accepting `Primary` costs nothing and cannot be ambiguous, and the
+ * CANONICAL lowercase form is what gets stored and echoed everywhere after.
+ *
+ * @returns {{ok: true, target: string} | {ok: false, detail: string}}
+ */
+export function validateWallpaperTarget(raw) {
+    const target = trimNoteId(raw).toLowerCase();
+    if (target.length === 0) return { ok: false, detail: 'X-Wallpaper-Target is empty after trimming' };
+    if (!WALLPAPER_TARGETS.includes(target)) {
+        return {
+            ok: false,
+            detail: `X-Wallpaper-Target must be "${WALLPAPER_TARGET_PRIMARY}" or "${WALLPAPER_TARGET_SET}"`,
+        };
+    }
+    return { ok: true, target };
 }
 
 /** Characters FAT/exFAT reserves. Replaced, not rejected — see below. */
@@ -511,10 +714,36 @@ const FAT_RESERVED = /["*:<>?|]/g;
  * @returns {{ok: true, filename: string} | {ok: false, detail: string}}
  */
 export function sanitizeBookFilename(raw) {
+    return sanitizeMediaFilename(raw, '.epub', BOOK_FILENAME_MAX_LEN);
+}
+
+/**
+ * Sanitize `X-Filename` into a name the reader can safely create under
+ * `/.sleep`. Identical rules to {@link sanitizeBookFilename}, `.bmp` instead of
+ * `.epub` — including the printable-ASCII rule, which here keeps a
+ * wallpaper.txt line one byte per character so a C string walk cannot disagree
+ * with Content-Length about where the four fields start.
+ *
+ * @returns {{ok: true, filename: string} | {ok: false, detail: string}}
+ */
+export function sanitizeWallpaperFilename(raw) {
+    return sanitizeMediaFilename(raw, '.bmp', WALLPAPER_FILENAME_MAX_LEN);
+}
+
+/**
+ * The shared body of {@link sanitizeBookFilename} and
+ * {@link sanitizeWallpaperFilename}.
+ *
+ * `extension` is lowercase and includes its dot. It is matched
+ * case-INSENSITIVELY and then rewritten to the canonical lowercase form, so
+ * `Sleep.BMP` and `sleep.bmp` cannot become two files on a case-insensitive
+ * SD card.
+ */
+function sanitizeMediaFilename(raw, extension, maxLen) {
     const trimmed = trimNoteId(raw); // same trim the firmware applies to ids
     if (trimmed.length === 0) return { ok: false, detail: 'X-Filename is empty after trimming' };
-    if (trimmed.length > BOOK_FILENAME_MAX_LEN) {
-        return { ok: false, detail: `X-Filename longer than ${BOOK_FILENAME_MAX_LEN} chars` };
+    if (trimmed.length > maxLen) {
+        return { ok: false, detail: `X-Filename longer than ${maxLen} chars` };
     }
     if (/[/\\]/.test(trimmed)) {
         return { ok: false, detail: 'X-Filename must be a bare filename, not a path' };
@@ -538,12 +767,14 @@ export function sanitizeBookFilename(raw) {
         .replace(FAT_RESERVED, '_')
         .replace(/[^\x20-\x7e]/g, '_');
 
-    if (!/\.epub$/i.test(cleaned)) return { ok: false, detail: 'X-Filename must end in .epub' };
+    if (cleaned.length < extension.length || cleaned.slice(-extension.length).toLowerCase() !== extension) {
+        return { ok: false, detail: `X-Filename must end in ${extension}` };
+    }
     // Normalise the extension's case so `Book.EPUB` and `book.epub` cannot become
     // two files on a case-insensitive SD card.
-    const filename = `${cleaned.slice(0, -5)}.epub`;
-    if (!/[^. ]/.test(filename.slice(0, -5))) {
-        return { ok: false, detail: 'X-Filename has no usable name before .epub' };
+    const filename = `${cleaned.slice(0, -extension.length)}${extension}`;
+    if (!/[^. ]/.test(filename.slice(0, -extension.length))) {
+        return { ok: false, detail: `X-Filename has no usable name before ${extension}` };
     }
     return { ok: true, filename };
 }
@@ -620,6 +851,36 @@ export function parseByteRange(value, size) {
 export function renderBooksManifest(books) {
     let out = '';
     for (const book of books) out += `${book.id} ${book.bytes} ${book.filename}\n`;
+    return out;
+}
+
+/**
+ * Render the wallpaper manifest. BYTE-EXACT CONTRACT, pinned by a test:
+ *
+ *   "{id} {bytes} {target} {filename}\n" per pending wallpaper, NEWEST LAST, no
+ *   header, no trailing blank line beyond each entry's own LF, and "" when
+ *   nothing is pending. `filename` is the literal WALLPAPER_NO_FILENAME ("-")
+ *   for every `primary`.
+ *
+ * TAKES THE STORED ORDER (newest first — the same order the books index keeps,
+ * so eviction and replacement are the same three lines) AND REVERSES IT. This
+ * function is the ONE place the wire ordering is decided, which is why the
+ * reversal lives here rather than at the call site: a reader applies the lines
+ * in order and the last write to /sleep.bmp wins, so newest-last is what makes
+ * "drain the manifest" end on the newest primary.
+ *
+ * Ids, byte counts and targets contain no spaces by construction, and the
+ * filename is the remainder of the line — so a reader parses a line as "up to
+ * the first three spaces, then the rest to the LF" and a filename containing a
+ * space still round-trips.
+ */
+export function renderWallpaperManifest(wallpapers) {
+    let out = '';
+    for (let i = wallpapers.length - 1; i >= 0; i--) {
+        const wp = wallpapers[i];
+        const filename = wp.filename ? wp.filename : WALLPAPER_NO_FILENAME;
+        out += `${wp.id} ${wp.bytes} ${wp.target} ${filename}\n`;
+    }
     return out;
 }
 
@@ -917,6 +1178,7 @@ async function handleStatus(method, req, boxId, store, config) {
     if (denied) return denied;
     const meta = await readMeta(store, boxId);
     const books = await readBooksIndex(store, boxId);
+    const wallpapers = await readWallpapersIndex(store, boxId);
     return json(200, {
         latestId: meta ? meta.latestId : null,
         bytes: meta ? meta.bytes : 0,
@@ -925,6 +1187,17 @@ async function handleStatus(method, req, boxId, store, config) {
         // does the box currently hold" without parsing books.txt, and it is the
         // ONLY place the app can see the library, because there is no ack state.
         books: books.map((book) => ({ id: book.id, filename: book.filename, bytes: book.bytes })),
+        // Same summary, same reason: with no acks this is the only way the app
+        // can show "queued, waiting for the reader's next sync window".
+        // `filename` is NULL for a primary — the "-" in the text manifest is a
+        // positional placeholder for a firmware line parser, not a name, and
+        // putting it in JSON would invent a filename the reader must not use.
+        wallpapers: wallpapers.map((wp) => ({
+            id: wp.id,
+            target: wp.target,
+            filename: wp.filename,
+            bytes: wp.bytes,
+        })),
     });
 }
 
@@ -1232,6 +1505,349 @@ async function handleBookItem(method, req, boxId, rawBookId, store, config) {
     return handleBookDownload(method, req, boxId, bookId.id, store);
 }
 
+// ---------------------------------------------------------------------------
+// Wallpapers
+//
+// Structurally the books routes with three differences, and only three:
+//   1. an entry carries a TARGET (`primary` | `set`) that tells the reader
+//      which file to write, and a primary carries no filename at all;
+//   2. a new primary SUPERSEDES the pending one instead of stacking;
+//   3. the manifest is rendered NEWEST LAST.
+// Everything else — ordering, eviction, GC, Range, auth placement, the
+// degrade-to-empty read path — is deliberately the same code shape, because
+// the books version is the one that has been reviewed against the firmware's
+// wake-window behaviour.
+// ---------------------------------------------------------------------------
+
+/** Bumped if the wallpaper manifest record ever changes shape. */
+const WALLPAPERS_INDEX_VERSION = 1;
+
+function encodeWallpapersIndex(wallpapers) {
+    return TEXT_ENCODER.encode(JSON.stringify({ v: WALLPAPERS_INDEX_VERSION, wallpapers }));
+}
+
+/**
+ * Decode the wallpaper manifest, NEWEST FIRST (the stored order), dropping
+ * anything a publish would not accept today.
+ *
+ * The round-trip checks are the load-bearing part, exactly as for books: a
+ * stored filename containing an LF would forge a manifest line, and a stored
+ * target outside the enum would tell the reader to write somewhere this
+ * contract does not define. Re-running the same validators and requiring an
+ * IDENTICAL result means the manifest can only emit values this contract would
+ * mint — whatever a store hands back.
+ *
+ * The at-most-one-pending-primary invariant is enforced HERE too, not only on
+ * the write path: stored order is newest first, so the first primary seen is
+ * the newest and any later one is a corrupted leftover that would cost the
+ * reader a wasted ~1.1 MB download inside a wake window.
+ *
+ * Junk decodes to `[]`: nothing pending is a normal wake, a 500 is a logged
+ * error on every one.
+ */
+function decodeWallpapersIndex(raw) {
+    if (!raw || raw.byteLength === 0) return [];
+    let parsed;
+    try {
+        parsed = JSON.parse(TEXT_DECODER.decode(raw));
+    } catch {
+        return [];
+    }
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.wallpapers)) return [];
+    const out = [];
+    for (const entry of parsed.wallpapers) {
+        if (!entry || typeof entry !== 'object') continue;
+        const id = validateWallpaperId(entry.id);
+        if (!id.ok || id.id !== entry.id) continue;
+        const target = validateWallpaperTarget(entry.target);
+        if (!target.ok || target.target !== entry.target) continue;
+
+        let filename;
+        if (target.target === WALLPAPER_TARGET_SET) {
+            const named = sanitizeWallpaperFilename(entry.filename);
+            if (!named.ok || named.filename !== entry.filename) continue;
+            filename = named.filename;
+        } else {
+            // A primary has NO filename. Anything else stored in that slot would
+            // land in the manifest field the "-" placeholder occupies, and the
+            // reader would write /sleep.bmp under a name instead.
+            if (entry.filename !== null && entry.filename !== undefined) continue;
+            filename = null;
+            if (out.some((seen) => seen.target === WALLPAPER_TARGET_PRIMARY)) continue;
+        }
+
+        if (!Number.isSafeInteger(entry.bytes) || entry.bytes < 1 || entry.bytes > MAX_WALLPAPER_BYTES) continue;
+        if (out.some((seen) => seen.id === entry.id)) continue;
+        out.push({
+            id: entry.id,
+            target: target.target,
+            filename,
+            bytes: entry.bytes,
+            updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : null,
+        });
+        // A corrupt index must not be able to produce a 500-line manifest that
+        // the reader downloads on every wake.
+        if (out.length >= MAX_WALLPAPERS) break;
+    }
+    return out;
+}
+
+/** Manifest read that never throws — same contract as {@link readBooksIndex}. */
+async function readWallpapersIndex(store, boxId) {
+    try {
+        return decodeWallpapersIndex(await store.get(wallpapersIndexKey(boxId)));
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Drop every blob the previous manifest referenced that the new one does not.
+ *
+ * Bounded by MAX_WALLPAPERS — no listing, no scan. Never fatal: a store that
+ * cannot delete leaks a blob nothing can reach, which is a cost, not a
+ * correctness problem.
+ */
+async function collectOrphanedWallpapers(store, boxId, next, before) {
+    if (typeof store?.delete !== 'function') return;
+    const kept = new Set(next.map((wp) => wp.id));
+    const done = new Set();
+    for (const wp of before) {
+        if (kept.has(wp.id) || done.has(wp.id)) continue;
+        done.add(wp.id);
+        try {
+            await store.delete(wallpaperKey(boxId, wp.id));
+        } catch {
+            // Garbage, not corruption: nothing reads a blob no manifest names.
+        }
+    }
+}
+
+async function handleWallpaperManifest(method, boxId, store) {
+    if (method !== 'GET' && method !== 'HEAD') return methodNotAllowed('GET, HEAD');
+    const wallpapers = await readWallpapersIndex(store, boxId);
+    const body = renderWallpaperManifest(wallpapers);
+    return {
+        status: 200,
+        headers: baseHeaders({
+            'content-type': 'text/plain; charset=utf-8',
+            // Measured in BYTES, not characters — see handleBooksManifest.
+            'content-length': String(TEXT_ENCODER.encode(body).byteLength),
+        }),
+        body: method === 'HEAD' ? null : body,
+    };
+}
+
+async function handleWallpaperPublish(method, req, boxId, store, config) {
+    if (method !== 'POST') return methodNotAllowed('POST');
+    const denied = requireWriteAuth(req, config);
+    if (denied) return denied;
+
+    const rawId = headerGet(req?.headers, 'x-wallpaper-id');
+    if (rawId === null) return badRequest('missing X-Wallpaper-Id header');
+    const id = validateWallpaperId(rawId);
+    if (!id.ok) return badRequest(id.detail);
+
+    const rawTarget = headerGet(req?.headers, 'x-wallpaper-target');
+    if (rawTarget === null) return badRequest('missing X-Wallpaper-Target header');
+    const target = validateWallpaperTarget(rawTarget);
+    if (!target.ok) return badRequest(target.detail);
+
+    // X-Filename is REQUIRED for `set` and IGNORED for `primary` — not
+    // "optional for primary". A primary has exactly one destination on the
+    // reader (/sleep.bmp), so honouring a name there would create a second
+    // source of truth for where the bytes land; storing null makes the
+    // manifest's "-" the only representable answer.
+    let filename = null;
+    if (target.target === WALLPAPER_TARGET_SET) {
+        const rawName = headerGet(req?.headers, 'x-filename');
+        if (rawName === null) return badRequest('missing X-Filename header (required when X-Wallpaper-Target is "set")');
+        const named = sanitizeWallpaperFilename(rawName);
+        if (!named.ok) return badRequest(named.detail);
+        filename = named.filename;
+    }
+
+    const body = asBytes(req?.body);
+    if (body.byteLength > MAX_WALLPAPER_BYTES) {
+        return json(413, {
+            ok: false,
+            error: 'wallpaper_too_large',
+            detail: `wallpaper is ${body.byteLength} bytes, cap is ${MAX_WALLPAPER_BYTES}`,
+        });
+    }
+    if (body.byteLength === 0) {
+        // A zero-length wallpaper would also make every Range request against it
+        // unsatisfiable, i.e. a 416 loop for a reader that cannot skip it.
+        return badRequest('empty body: a wallpaper is never zero bytes');
+    }
+
+    const nowMs = typeof config?.now === 'function' ? config.now() : Date.now();
+    const updatedAt = new Date(nowMs).toISOString();
+    const before = await readWallpapersIndex(store, boxId);
+    const entry = { id: id.id, target: target.target, filename, bytes: body.byteLength, updatedAt };
+
+    // BLOB FIRST, INDEX SECOND — the manifest must never advertise a wallpaper
+    // whose bytes are absent. Same reasoning as books: the reader budgets a wake
+    // window per download, and on KV the two keys replicate independently.
+    try {
+        await store.put(wallpaperKey(boxId, entry.id), body);
+    } catch {
+        return json(503, { ok: false, error: 'storage_error', published: false, detail: 'wallpaper write failed' });
+    }
+
+    // Newest first in storage. A wallpaper replaces any entry with the SAME ID
+    // (that is what a retry is), and a `primary` additionally supersedes the
+    // pending `primary` — see the header. `set` items never supersede each
+    // other: they land in different files under /.sleep and are all wanted.
+    const supersedesPrimary = entry.target === WALLPAPER_TARGET_PRIMARY;
+    const kept = before.filter(
+        (wp) => wp.id !== entry.id && !(supersedesPrimary && wp.target === WALLPAPER_TARGET_PRIMARY)
+    );
+    // The cap is applied AFTER the new entry goes on the front, so the 9th
+    // wallpaper evicts the oldest rather than being refused.
+    const next = [entry, ...kept].slice(0, MAX_WALLPAPERS);
+
+    try {
+        await store.put(wallpapersIndexKey(boxId), encodeWallpapersIndex(next));
+    } catch {
+        // The blob landed but the manifest did not, so no reader can see it. The
+        // blob is NOT collected here, for the same reason publish leaves an
+        // orphaned frame: a `put` that threw may still have landed, and deleting
+        // the bytes of an index that actually moved would turn a live wallpaper
+        // into a permanent 404. A retry overwrites it; `wrangler kv key list
+        // --prefix box:{id}:wallpaper:` finds anything that accumulates.
+        return json(503, { ok: false, error: 'storage_error', published: false, detail: 'wallpaper index write failed' });
+    }
+
+    // GC LAST, and never fatally — the wallpaper is live the moment the index
+    // lands. This is also what drops the superseded primary's bytes.
+    await collectOrphanedWallpapers(store, boxId, next, before);
+
+    return json(200, {
+        ok: true,
+        id: entry.id,
+        target: entry.target,
+        filename: entry.filename,
+        bytes: entry.bytes,
+    });
+}
+
+async function handleWallpaperDelete(req, boxId, wallpaperId, store, config) {
+    const denied = requireWriteAuth(req, config);
+    if (denied) return denied;
+    const before = await readWallpapersIndex(store, boxId);
+    const entry = before.find((wp) => wp.id === wallpaperId);
+    if (!entry) return notFound();
+    const next = before.filter((wp) => wp.id !== wallpaperId);
+
+    // INDEX FIRST, BLOB SECOND — the mirror image of publish, for the mirror
+    // reason: the manifest must stop advertising it before its bytes go.
+    try {
+        await store.put(wallpapersIndexKey(boxId), encodeWallpapersIndex(next));
+    } catch {
+        return json(503, { ok: false, error: 'storage_error', deleted: false, detail: 'wallpaper index write failed' });
+    }
+    await collectOrphanedWallpapers(store, boxId, next, before);
+    return json(200, { ok: true, id: entry.id, target: entry.target, filename: entry.filename });
+}
+
+/**
+ * Serve one wallpaper, whole or in one range. THE RESUME PATH, byte-for-byte
+ * the books path — see {@link handleBookDownload} for why the size is taken
+ * from the manifest and re-checked against the blob, and why `stat`/`getRange`
+ * are optional.
+ */
+async function handleWallpaperDownload(method, req, boxId, wallpaperId, store) {
+    const wallpapers = await readWallpapersIndex(store, boxId);
+    const entry = wallpapers.find((wp) => wp.id === wallpaperId);
+    if (!entry) return notFound();
+
+    const key = wallpaperKey(boxId, wallpaperId);
+    const ranged = typeof store?.stat === 'function' && typeof store?.getRange === 'function';
+    let size = null;
+    let blob = null;
+    try {
+        if (ranged) {
+            const stat = await store.stat(key);
+            size = stat && Number.isSafeInteger(stat.bytes) ? stat.bytes : null;
+        } else {
+            blob = await store.get(key);
+            size = blob ? blob.byteLength : null;
+        }
+    } catch {
+        return json(500, { ok: false, error: 'storage_error' });
+    }
+    // The manifest names it but the bytes are not here: an unreplicated blob, or
+    // one a crash removed. 404 is self-healing — the reader retries next window.
+    if (size === null) return notFound();
+    if (size !== entry.bytes) {
+        return json(500, { ok: false, error: 'corrupt_wallpaper', bytes: size, expected: entry.bytes });
+    }
+
+    const range = parseByteRange(headerGet(req?.headers, 'range'), size);
+    if (range && range.unsatisfiable) {
+        return {
+            status: 416,
+            headers: baseHeaders({
+                'content-type': 'application/json; charset=utf-8',
+                'accept-ranges': 'bytes',
+                'content-range': `bytes */${size}`,
+            }),
+            body: JSON.stringify({ ok: false, error: 'range_not_satisfiable', bytes: size }),
+        };
+    }
+
+    const start = range ? range.start : 0;
+    const end = range ? range.end : size - 1;
+    const length = end - start + 1;
+    const headers = baseHeaders({
+        'content-type': WALLPAPER_CONTENT_TYPE,
+        'content-length': String(length),
+        'accept-ranges': 'bytes',
+    });
+    // Only a `set` item has a name to disclose. A primary's destination is fixed
+    // (/sleep.bmp) and naming it here would invent a filename the reader must
+    // not use; omitting the header is the honest answer. Quoting is safe: the
+    // sanitizer leaves no quote, backslash, CR or LF in the name.
+    if (entry.filename) headers['content-disposition'] = `attachment; filename="${entry.filename}"`;
+    if (range) headers['content-range'] = `bytes ${start}-${end}/${size}`;
+    const status = range ? 206 : 200;
+
+    if (method === 'HEAD') return { status, headers, body: null };
+
+    let bytes;
+    if (blob) {
+        bytes = start === 0 && length === size ? blob : blob.subarray(start, end + 1);
+    } else {
+        try {
+            bytes = await store.getRange(key, start, length);
+        } catch {
+            return json(500, { ok: false, error: 'storage_error' });
+        }
+        if (bytes === null || bytes === undefined) return notFound();
+        if (bytes.byteLength !== length) {
+            // A short read means the blob changed under us between stat and read.
+            return json(500, { ok: false, error: 'corrupt_wallpaper', bytes: bytes.byteLength, expected: length });
+        }
+    }
+    return { status, headers, body: bytes };
+}
+
+/** `/wallpaper/{id}`: reads are open (the boxId is the capability), DELETE is not. */
+async function handleWallpaperItem(method, req, boxId, rawWallpaperId, store, config) {
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'DELETE') {
+        return methodNotAllowed('GET, HEAD, DELETE');
+    }
+    // Validate BEFORE the id reaches wallpaperKey(): this segment is
+    // attacker-supplied and the dev server turns store keys into filesystem
+    // paths. A malformed id is 404 rather than 400 — it names nothing, and 400
+    // would tell a prober the difference between "bad shape" and "no such item".
+    const wallpaperId = validateWallpaperId(rawWallpaperId);
+    if (!wallpaperId.ok) return notFound();
+    if (method === 'DELETE') return handleWallpaperDelete(req, boxId, wallpaperId.id, store, config);
+    return handleWallpaperDownload(method, req, boxId, wallpaperId.id, store);
+}
+
 /**
  * The whole mailbox, as one function.
  *
@@ -1246,12 +1862,17 @@ export async function handleRequest(req, store, config = {}) {
     if (!parsed) return notFound();
     const { boxId, leaf, sub } = parsed;
 
-    // `/books` is the only leaf with a child segment: bare for the upload,
-    // `/books/{id}` for download and delete.
+    // `/books` and `/wallpaper` are the only leaves with a child segment: bare
+    // for the upload, `/{leaf}/{id}` for download and delete.
     if (leaf === 'books') {
         return sub === undefined
             ? handleBooksPublish(method, req, boxId, store, config)
             : handleBookItem(method, req, boxId, sub, store, config);
+    }
+    if (leaf === 'wallpaper') {
+        return sub === undefined
+            ? handleWallpaperPublish(method, req, boxId, store, config)
+            : handleWallpaperItem(method, req, boxId, sub, store, config);
     }
     // Every other route is exactly three segments, so a fourth is off-contract
     // (`/latest.txt/extra`) and must not resolve to the three-segment route.
@@ -1268,6 +1889,8 @@ export async function handleRequest(req, store, config = {}) {
             return handleStatus(method, req, boxId, store, config);
         case 'books.txt':
             return handleBooksManifest(method, boxId, store);
+        case 'wallpaper.txt':
+            return handleWallpaperManifest(method, boxId, store);
         default:
             return notFound();
     }
@@ -1287,14 +1910,18 @@ export async function handleRequest(req, store, config = {}) {
  */
 export function requestBodyLimit(method, path) {
     const parsed = parsePath(path);
-    const isBookUpload =
+    const isUploadTo = (leaf) =>
         parsed !== null &&
-        parsed.leaf === 'books' &&
+        parsed.leaf === leaf &&
         parsed.sub === undefined &&
         String(method ?? '').toUpperCase() === 'POST';
-    return isBookUpload
-        ? { bytes: MAX_BOOK_BYTES, error: 'book_too_large' }
-        : { bytes: MAX_REQUEST_BODY_BYTES, error: 'frame_too_large' };
+    if (isUploadTo('books')) return { bytes: MAX_BOOK_BYTES, error: 'book_too_large' };
+    // 4 MiB is still far above MAX_REQUEST_BODY_BYTES, so `POST /wallpaper`
+    // inherits the auth-before-buffering rule below automatically in BOTH
+    // adapters — the predicate they branch on is
+    // `requestBodyLimit(...).bytes > MAX_REQUEST_BODY_BYTES`, not a route list.
+    if (isUploadTo('wallpaper')) return { bytes: MAX_WALLPAPER_BYTES, error: 'wallpaper_too_large' };
+    return { bytes: MAX_REQUEST_BODY_BYTES, error: 'frame_too_large' };
 }
 
 /**
@@ -1303,7 +1930,8 @@ export function requestBodyLimit(method, path) {
  * produced (401, or 503 when the deploy has no usable token).
  *
  * WHY THIS EXISTS — memory, not access control. `handleRequest` already refuses
- * an unauthenticated `POST /books`, but by then the adapter has buffered the
+ * an unauthenticated `POST /books` (and `POST /wallpaper`, which is on the same
+ * side of the predicate at 4 MiB), but by then the adapter has buffered the
  * whole body, because {@link requestBodyLimit} keys the cap off method+path and
  * cannot see credentials. The boxId in the path is a READ capability that
  * travels in cleartext over plain http by design, so it is not a secret: with

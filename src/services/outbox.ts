@@ -36,20 +36,30 @@
  * ---------------------------------------------------------------------------
  *   {"version":1,"items":[
  *     {"id","kind","bytes","bodyPath","queuedAt"},                  // note
- *     {"id","kind","filename","bytes","bodyPath","queuedAt","deliveredAt"} // book
+ *     {"id","kind","filename","bytes","bodyPath","queuedAt","deliveredAt"}, // book
+ *     {"id","kind","target","filename"?,"bytes","bodyPath","queuedAt"} // wallpaper
  *   ]}
  *
  * Rules the Kotlin side is entitled to rely on, and which the golden test holds:
  *   - `items` is QUEUE ORDER, oldest first. "Newest note" is therefore the LAST
  *     item with `kind: 'note'` — that is the id `latest.txt` should answer with
- *     and the body `current.frame` should serve.
+ *     and the body `current.frame` should serve. `wallpaper.txt` is emitted in
+ *     this same order (NEWEST LAST), because a reader applying the lines in
+ *     order has to finish on the newest primary.
  *   - `bytes` is the exact body length. `books.txt` lines are
  *     `{id} {bytes} {filename}\n` and the reader compares that number against
  *     every `Content-Range` total it sees, so a wrong one strands a download.
- *   - `filename` is present on books, absent on notes, and is already sanitized
- *     to printable ASCII with no space-free-field ambiguity: no CR/LF, no path
- *     separator, ≤ {@link OUTBOX_FILENAME_MAX_CHARS}. §2 makes the SERVER
- *     responsible for that, and here the phone is the server.
+ *     `wallpaper.txt` lines are `{id} {bytes} {target} {filename}\n` with '-' in
+ *     the filename position for a primary, and the same size rule applies.
+ *   - `filename` is present on books, on 'set' wallpapers, absent on notes and on
+ *     'primary' wallpapers, and is already sanitized to printable ASCII with no
+ *     space-free-field ambiguity: no CR/LF, no path separator,
+ *     ≤ {@link OUTBOX_FILENAME_MAX_CHARS}. §2 makes the SERVER responsible for
+ *     that, and here the phone is the server.
+ *   - `target` is present ONLY on wallpapers and is 'primary' or 'set'. It is on
+ *     the wire rather than inferred because the two mean two different files on
+ *     the card (`/sleep.bmp` versus `/.sleep/<filename>`) and a reader that had
+ *     to guess would put a pinned picture into the random rotation.
  *   - `deliveredAt` present means the reader has already taken this item whole.
  *     The server should leave it OUT of `latest.txt` / `books.txt` but MAY still
  *     answer `books/{id}` for it, so a reader that lost its staging can re-pull
@@ -97,6 +107,7 @@ export const OUTBOX_MANIFEST_VERSION = 1 as const;
 /** Body suffixes. The extension is cosmetic — Kotlin goes by `kind`. */
 const NOTE_BODY_EXT = '.frame';
 const BOOK_BODY_EXT = '.epub';
+const WALLPAPER_BODY_EXT = '.bmp';
 
 /**
  * Hard cap on stored items, delivered or not.
@@ -171,18 +182,41 @@ const FILENAME_ILLEGAL = /[^ -~]|[\\/:*?"<>|]/;
 // Shapes
 // ---------------------------------------------------------------------------
 
-export type OutboxKind = 'note' | 'book';
+export type OutboxKind = 'note' | 'book' | 'wallpaper';
+
+/**
+ * Which sleep-screen slot a queued wallpaper is aimed at. Wallpapers only.
+ *
+ * Same two words, and the same meaning, as `mailbox_client`'s
+ * `MailboxWallpaperTarget` and `wallpaper_sender`'s `WallpaperTarget.kind`, so
+ * one send carries one target down all three roads (direct, mailbox, handover)
+ * without a translation table anywhere.
+ */
+export type OutboxWallpaperTarget = 'primary' | 'set';
 
 export interface OutboxItem {
     /**
-     * The id the reader will see: a note's dedup id (`latest.txt`) or a book's
-     * manifest id (`books.txt`, `books/{id}`). Minted by the caller so a queued
-     * item and a published one can be the SAME item — a note that later reaches
-     * the mailbox under this id is deduped by the reader, not shown twice.
+     * The id the reader will see: a note's dedup id (`latest.txt`), a book's
+     * manifest id (`books.txt`, `books/{id}`) or a wallpaper's
+     * (`wallpaper.txt`, `wallpaper/{id}`). Minted by the caller so a queued item
+     * and a published one can be the SAME item — a note that later reaches the
+     * mailbox under this id is deduped by the reader, not shown twice.
      */
     id: string;
     kind: OutboxKind;
-    /** Books only. Already sanitized; see {@link OUTBOX_FILENAME_MAX_CHARS}. */
+    /**
+     * Wallpapers only, and REQUIRED on them.
+     *
+     * Absent on a wallpaper is not a defaultable field: 'primary' overwrites the
+     * one slot the firmware prefers over everything else, so guessing it would
+     * replace a sleep screen the user never asked to replace.
+     */
+    target?: OutboxWallpaperTarget;
+    /**
+     * Books and 'set' wallpapers. Already sanitized; see
+     * {@link OUTBOX_FILENAME_MAX_CHARS}. Absent on notes and on 'primary'
+     * wallpapers, whose destination is a fixed path with no name to carry.
+     */
     filename?: string;
     /** Exact body length. What `books.txt` publishes and the reader checks. */
     bytes: number;
@@ -214,6 +248,7 @@ export interface OutboxSummary {
     pending: number;
     pendingNotes: number;
     pendingBooks: number;
+    pendingWallpapers: number;
     /** Body bytes of the pending items. */
     pendingBytes: number;
     /** Items already handed over and still inside the retention window. */
@@ -431,8 +466,15 @@ function outboxDir(system: OutboxFileSystem): string {
     return `${root.endsWith('/') ? root : `${root}/`}${OUTBOX_DIR_NAME}/`;
 }
 
+/** Cosmetic per-kind suffix. Kotlin routes on `kind`, never on this. */
+function bodyExtFor(kind: OutboxKind): string {
+    if (kind === 'note') return NOTE_BODY_EXT;
+    if (kind === 'wallpaper') return WALLPAPER_BODY_EXT;
+    return BOOK_BODY_EXT;
+}
+
 function bodyPathFor(system: OutboxFileSystem, kind: OutboxKind, id: string): string {
-    return `${outboxDir(system)}${kind}-${id}${kind === 'note' ? NOTE_BODY_EXT : BOOK_BODY_EXT}`;
+    return `${outboxDir(system)}${kind}-${id}${bodyExtFor(kind)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +524,46 @@ export function describeOutboxFilenameProblem(filename: unknown): string | null 
     return null;
 }
 
+/**
+ * Why `filename` cannot ride a `wallpaper.txt` line, or null when it can.
+ *
+ * The same charset argument as {@link describeOutboxFilenameProblem} with two
+ * differences that both come from the line format:
+ *
+ *   - `.bmp`, not `.epub`. The firmware scans `/.sleep` for that extension, so a
+ *     name without it is a file the reader writes and then never looks at.
+ *   - A BARE '-' IS REFUSED. `wallpaper.txt` writes '-' in the filename position
+ *     for a primary, so a rotation entry literally called '-' would be
+ *     indistinguishable from "this one has no name" — and would be applied to
+ *     `/sleep.bmp` instead of the rotation.
+ *
+ * Rejected, never repaired, for the reason the book half gives: a "fixed" name
+ * can lose its extension, and a name that differs from the one the direct route
+ * would have used produces a SECOND copy of a picture the user already sent.
+ */
+export function describeOutboxWallpaperFilenameProblem(filename: unknown): string | null {
+    if (typeof filename !== 'string' || filename.trim().length === 0) {
+        return 'Wallpaper filename is empty.';
+    }
+    if (filename.length > OUTBOX_FILENAME_MAX_CHARS) {
+        return `Wallpaper filename is longer than ${OUTBOX_FILENAME_MAX_CHARS} characters.`;
+    }
+    if (FILENAME_ILLEGAL.test(filename)) {
+        return `Wallpaper filename has a character a wallpaper.txt line cannot carry: ${JSON.stringify(filename)}`;
+    }
+    if (filename.startsWith('.')) return 'Wallpaper filename cannot start with a dot.';
+    if (filename === '-') return 'Wallpaper filename cannot be "-" (that means "no name").';
+    if (!/\.bmp$/i.test(filename)) {
+        return `Wallpaper filename must end in .bmp: ${JSON.stringify(filename)}`;
+    }
+    return null;
+}
+
+/** Coerce an unknown into a wallpaper target, or null. */
+function asWallpaperTarget(value: unknown): OutboxWallpaperTarget | null {
+    return value === 'primary' || value === 'set' ? value : null;
+}
+
 // ---------------------------------------------------------------------------
 // Index I/O (callers must hold the lock)
 // ---------------------------------------------------------------------------
@@ -492,7 +574,8 @@ function asItem(value: unknown): OutboxItem | null {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     const raw = value as Record<string, unknown>;
     if (describeOutboxIdProblem(raw.id) !== null) return null;
-    const kind = raw.kind === 'book' ? 'book' : raw.kind === 'note' ? 'note' : null;
+    const kind: OutboxKind | null =
+        raw.kind === 'book' || raw.kind === 'note' || raw.kind === 'wallpaper' ? raw.kind : null;
     if (kind === null) return null;
     if (typeof raw.bodyPath !== 'string' || raw.bodyPath.length === 0) return null;
     const bytes = typeof raw.bytes === 'number' && Number.isFinite(raw.bytes) ? raw.bytes : -1;
@@ -515,6 +598,21 @@ function asItem(value: unknown): OutboxItem | null {
         // A book with no usable name cannot be listed; dropping the row is the
         // honest outcome, since the reader creates the file from that name.
         return null;
+    } else if (kind === 'wallpaper') {
+        // NO DEFAULT FOR `target`, deliberately: 'primary' overwrites the single
+        // slot the firmware prefers over everything, so a row whose target
+        // cannot be read must not be guessed into it. Dropped instead, which
+        // costs one handover and is self-healing on the next enqueue.
+        const target = asWallpaperTarget(raw.target);
+        if (target === null) return null;
+        item.target = target;
+        if (target === 'set') {
+            if (describeOutboxWallpaperFilenameProblem(raw.filename) !== null) return null;
+            item.filename = raw.filename as string;
+        }
+        // A 'primary' carries NO filename even if the manifest supplied one: the
+        // destination is the fixed `/sleep.bmp`, and a name in the line would be
+        // a value the reader has to know to ignore.
     }
     if (typeof raw.deliveredAt === 'number' && Number.isFinite(raw.deliveredAt)) {
         item.deliveredAt = raw.deliveredAt;
@@ -575,6 +673,11 @@ async function readIndex(): Promise<OutboxItem[]> {
  */
 function serializeItem(item: OutboxItem): Record<string, unknown> {
     const out: Record<string, unknown> = { id: item.id, kind: item.kind };
+    // `target` sits between `kind` and `filename` because it is only ever
+    // present on wallpapers: notes and books serialise BYTE-IDENTICALLY to what
+    // they always have, so the golden manifest test keeps its old expectations
+    // for every item shape that existed before wallpapers did.
+    if (item.target !== undefined) out.target = item.target;
     if (item.filename !== undefined) out.filename = item.filename;
     out.bytes = item.bytes;
     out.bodyPath = item.bodyPath;
@@ -766,6 +869,7 @@ export function summarizeOutbox(items: OutboxItem[]): OutboxSummary {
     let pending = 0;
     let pendingNotes = 0;
     let pendingBooks = 0;
+    let pendingWallpapers = 0;
     let pendingBytes = 0;
     let delivered = 0;
     for (const item of items) {
@@ -775,10 +879,13 @@ export function summarizeOutbox(items: OutboxItem[]): OutboxSummary {
         }
         pending += 1;
         pendingBytes += item.bytes;
+        // Written as a three-way switch rather than "note or else book": with a
+        // third kind, the old `else` silently counted every wallpaper as a book.
         if (item.kind === 'note') pendingNotes += 1;
+        else if (item.kind === 'wallpaper') pendingWallpapers += 1;
         else pendingBooks += 1;
     }
-    return { pending, pendingNotes, pendingBooks, pendingBytes, delivered };
+    return { pending, pendingNotes, pendingBooks, pendingWallpapers, pendingBytes, delivered };
 }
 
 /**
@@ -903,6 +1010,74 @@ export async function enqueueBook(
 }
 
 /**
+ * Queue one wallpaper BMP under `wallpaperId`.
+ *
+ * ---------------------------------------------------------------------------
+ * BASE64, AND WHY THAT IS ACCEPTABLE HERE AND NOT FOR A BOOK
+ * ---------------------------------------------------------------------------
+ * `enqueueBook` COPIES natively precisely so a 24 MiB epub never becomes a JS
+ * string. A wallpaper cannot take that road: it does not exist as a file at all
+ * — `prepareWallpaperBmp` hands back a `Uint8Array` the encoder just built in
+ * memory — so writing it means encoding it, exactly as `enqueueNote` does for a
+ * frame. The size is what makes that safe: the sleep screen is 528x792 8-bit,
+ * so a BMP is ~419 KB and the base64 of it ~560 KB, an order of magnitude under
+ * the allocation shape HANDOFF.md records as an OOM crash.
+ *
+ * `target` IS REQUIRED and is not defaultable. See {@link OutboxItem.target}.
+ * A 'set' wallpaper must carry a name; a 'primary' must NOT (its destination is
+ * the fixed `/sleep.bmp`, and a name would be a value the reader has to ignore).
+ *
+ * The id is the CALLER's, like a note's and a book's, so an item that reaches
+ * the reader by both the mailbox and the handover is ONE item, not two.
+ */
+export async function enqueueWallpaper(
+    bmp: Uint8Array,
+    wallpaperId: string,
+    target: OutboxWallpaperTarget,
+    filename?: string
+): Promise<OutboxItem> {
+    const idProblem = describeOutboxIdProblem(wallpaperId);
+    if (idProblem) throw new OutboxError(idProblem);
+    if (asWallpaperTarget(target) === null) {
+        throw new OutboxError(
+            `Wallpaper target must be 'primary' or 'set' (got ${JSON.stringify(target)}).`
+        );
+    }
+    if (!bmp || bmp.byteLength === 0) throw new OutboxError('Wallpaper is empty.');
+
+    const name = target === 'set' ? (typeof filename === 'string' ? filename.trim() : '') : '';
+    if (target === 'set') {
+        const nameProblem = describeOutboxWallpaperFilenameProblem(name);
+        if (nameProblem) throw new OutboxError(nameProblem);
+    }
+
+    const system = getFs();
+    if (!system || !system.documentDirectory) {
+        throw new OutboxError('This runtime cannot store a handover queue.');
+    }
+
+    const dir = outboxDir(system);
+    try {
+        await system.makeDirectory(dir);
+    } catch {
+        // Already exists.
+    }
+    const bodyPath = bodyPathFor(system, 'wallpaper', wallpaperId);
+    await system.writeBase64(bodyPath, uint8ArrayToBase64(bmp));
+
+    const item: OutboxItem = {
+        id: wallpaperId,
+        kind: 'wallpaper',
+        target,
+        bytes: bmp.byteLength,
+        bodyPath,
+        queuedAt: Date.now(),
+    };
+    if (target === 'set') item.filename = name;
+    return commitItem(item);
+}
+
+/**
  * Insert (or replace) one item, prune, persist, notify.
  *
  * REPLACE, not append-twice: re-queuing an id is a RETRY of the same thing (a
@@ -1011,6 +1186,67 @@ export async function supersedeQueuedNotes(keepId?: string): Promise<string[]> {
                 : pendingNotes[pendingNotes.length - 1].id;
 
         const dropped = pendingNotes.filter(item => item.id !== keep);
+        if (dropped.length === 0) return [];
+        const droppedIds = new Set(dropped.map(item => item.id));
+        const kept = items.filter(item => !droppedIds.has(item.id));
+
+        await removeBodies(dropped);
+        await writeIndex(kept);
+        notify(kept);
+        return dropped.map(item => item.id);
+    });
+}
+
+/**
+ * Drop every queued PRIMARY wallpaper but the newest, and report which ids went.
+ *
+ * ---------------------------------------------------------------------------
+ * THE READER HAS ONE `/sleep.bmp`, EXACTLY AS IT HAS ONE NOTE SLOT
+ * ---------------------------------------------------------------------------
+ * This is {@link supersedeQueuedNotes}' argument applied to the other
+ * single-slot destination, and it is the local half of the server's own
+ * retention rule ("a NEW primary supersedes any earlier undelivered primary" —
+ * see `mailbox_client`'s wallpaper section). Three queued primaries can only
+ * ever end in one picture on the card; the other two are not "waiting", they are
+ * a pair of ~419 KB bodies and two wake windows of radio spent to be overwritten.
+ *
+ * ROTATION ENTRIES ARE UNTOUCHED, and that is the whole reason this is a
+ * separate function from the note one rather than a generalisation of it: a
+ * `/.sleep` set is a BAG, every entry is a distinct file with its own name, and
+ * collapsing it would delete wallpapers the user deliberately added.
+ *
+ * Ids are RETURNED rather than swallowed so a caller with a UI record for the
+ * dropped item can patch it, exactly as the note path patches History.
+ *
+ * Never throws, and returns `[]` when there is at most one pending primary —
+ * the overwhelmingly common case.
+ */
+export async function supersedeQueuedPrimaryWallpapers(keepId?: string): Promise<string[]> {
+    return withLock(async () => {
+        let items: OutboxItem[];
+        try {
+            items = await readIndex();
+        } catch (e) {
+            console.warn('[Outbox] Could not read the queue to collapse wallpapers:', e);
+            return [];
+        }
+        const pendingPrimaries = items.filter(
+            item =>
+                item.kind === 'wallpaper' &&
+                item.target === 'primary' &&
+                item.deliveredAt === undefined
+        );
+        if (pendingPrimaries.length <= 1) return [];
+
+        // The caller's choice wins only if it is actually IN the queue; otherwise
+        // the newest pending primary does, because that is the one the reader
+        // would end on and dropping it would turn this into data loss.
+        const keep =
+            typeof keepId === 'string' && pendingPrimaries.some(item => item.id === keepId)
+                ? keepId
+                : pendingPrimaries[pendingPrimaries.length - 1].id;
+
+        const dropped = pendingPrimaries.filter(item => item.id !== keep);
         if (dropped.length === 0) return [];
         const droppedIds = new Set(dropped.map(item => item.id));
         const kept = items.filter(item => !droppedIds.has(item.id));

@@ -18,20 +18,24 @@
  * unbounded node processes before, so this server:
  *   - caps every request body PER ROUTE (`core.js` `requestBodyLimit`): 64 KB
  *     for the note routes (one frame is 52272 B), MAX_BOOK_BYTES for
- *     `POST /books` because an epub genuinely is megabytes. Past the cap the
- *     bytes are discarded as they arrive and the request is answered 413 with
- *     `Connection: close`, so it can never buffer an attacker-chosen amount AND
- *     the client still learns why it was refused;
+ *     `POST /books` because an epub genuinely is megabytes, MAX_WALLPAPER_BYTES
+ *     for `POST /wallpaper` because a full-bleed 8bpp BMP is ~1.1 MB. Past the
+ *     cap the bytes are discarded as they arrive and the request is answered
+ *     413 with `Connection: close`, so it can never buffer an attacker-chosen
+ *     amount AND the client still learns why it was refused;
  *   - checks the bearer token BEFORE buffering on any route whose cap is above
  *     the notes cap, so knowing the boxId (a READ capability, cleartext by
  *     design) is not enough to make this process allocate 24 MB per request;
  *   - serves exactly ONE box id, so no number of published ids widens it;
- *   - reads a book RANGE straight off the disk (`--data-dir`), so resuming a
- *     24 MB epub costs the size of the window asked for, not the whole file.
- *     **Prefer `--data-dir` once books are in play**: the in-memory store keeps
- *     every book resident, so its worst case is MAX_BOOKS x MAX_BOOK_BYTES
- *     (20 x 24 MB) plus one frame, and the systemd unit on the devbox sets
- *     `MemoryMax=256M` — enough for one upload at a time, not for a library;
+ *   - reads a book or wallpaper RANGE straight off the disk (`--data-dir`), so
+ *     resuming a 24 MB epub (or a 1.1 MB BMP) costs the size of the window
+ *     asked for, not the whole file.
+ *     **Prefer `--data-dir` once books or wallpapers are in play**: the
+ *     in-memory store keeps every blob resident, so its worst case is
+ *     MAX_BOOKS x MAX_BOOK_BYTES (20 x 24 MB) plus
+ *     MAX_WALLPAPERS x MAX_WALLPAPER_BYTES (8 x 4 MB) plus one frame, and the
+ *     systemd unit on the devbox sets `MemoryMax=256M` — enough for one upload
+ *     at a time, not for a library;
  *   - is single-process — no cluster, no worker_threads, no child processes;
  *   - bounds every phase of a connection (headers/request/keep-alive timeouts);
  *   - self-terminates after --ttl seconds (default 1800, max 86400).
@@ -56,6 +60,8 @@ import {
     MAX_BOOKS,
     MAX_BOOK_BYTES,
     MAX_REQUEST_BODY_BYTES,
+    MAX_WALLPAPERS,
+    MAX_WALLPAPER_BYTES,
     BOX_ID_PATTERN,
     MIN_WRITE_TOKEN_LEN,
     buildBaseUrl,
@@ -453,7 +459,9 @@ async function main() {
                     const limit = requestBodyLimit(method, path);
 
                     // AUTH BEFORE BUFFERING on any route whose cap is above the
-                    // notes cap — i.e. `POST /books`. `requestBodyLimit` sees
+                    // notes cap — `POST /books` and `POST /wallpaper`. This is
+                    // a PREDICATE, not a route list, which is why the wallpaper
+                    // route inherited it for free. `requestBodyLimit` sees
                     // only method+path and so cannot tell a credentialed upload
                     // from an anonymous one; the boxId in the path is a READ
                     // capability that travels in cleartext over plain http by
@@ -533,9 +541,12 @@ async function main() {
             `  store          ${store.root ? `files under ${store.root}` : 'in-memory (lost on restart)'}`,
             `  frame size     ${FRAME_BYTES} bytes (exact; anything else is rejected)`,
             `  body cap       ${MAX_REQUEST_BODY_BYTES} bytes (notes) / ${MAX_BOOK_BYTES} bytes (POST /books)`,
+            `                 / ${MAX_WALLPAPER_BYTES} bytes (POST /wallpaper)`,
             `  books          up to ${MAX_BOOKS} per box, oldest evicted${
                 store.root ? ', ranged reads off disk' : ' — IN MEMORY, prefer --data-dir'
             }`,
+            `  wallpapers     up to ${MAX_WALLPAPERS} pending per box, oldest evicted;`,
+            '                 a new "primary" supersedes the pending one',
             opts.ttl > 0
                 ? `  self-terminate in ${opts.ttl}s`
                 : '  self-terminate DISABLED (--ttl 0) — run this under a supervisor only',
@@ -563,6 +574,21 @@ async function main() {
             `  curl -sS '${baseUrl}/books.txt'`,
             `  curl -sS -r 1024- '${baseUrl}/books/smoke-book-1' -o /tmp/tail.bin -D -`,
             `  curl -sS -X DELETE '${baseUrl}/books/smoke-book-1' -H 'Authorization: Bearer ${tokenForDisplay}'`,
+            '',
+            'Wallpapers (same box, same token; wallpaper.txt is NEWEST LAST):',
+            `  curl -sS -X POST '${baseUrl}/wallpaper' \\`,
+            `    -H 'Authorization: Bearer ${tokenForDisplay}' \\`,
+            "    -H 'Content-Type: application/octet-stream' \\",
+            "    -H 'X-Wallpaper-Id: smoke-wp-1' -H 'X-Wallpaper-Target: primary' \\",
+            '    --data-binary @/tmp/sleep.bmp',
+            `  curl -sS -X POST '${baseUrl}/wallpaper' \\`,
+            `    -H 'Authorization: Bearer ${tokenForDisplay}' \\`,
+            "    -H 'Content-Type: application/octet-stream' \\",
+            "    -H 'X-Wallpaper-Id: smoke-wp-2' -H 'X-Wallpaper-Target: set' \\",
+            "    -H 'X-Filename: Smoke Test.bmp' --data-binary @/tmp/sleep.bmp",
+            `  curl -sS '${baseUrl}/wallpaper.txt'`,
+            `  curl -sS -r 1024- '${baseUrl}/wallpaper/smoke-wp-1' -o /tmp/tail.bin -D -`,
+            `  curl -sS -X DELETE '${baseUrl}/wallpaper/smoke-wp-1' -H 'Authorization: Bearer ${tokenForDisplay}'`,
             '',
         ].join('\n')
     );

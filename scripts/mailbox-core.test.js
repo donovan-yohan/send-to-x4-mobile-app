@@ -25,9 +25,17 @@ import {
     MAX_BOOKS,
     MAX_BOOK_BYTES,
     MAX_REQUEST_BODY_BYTES,
+    MAX_WALLPAPERS,
+    MAX_WALLPAPER_BYTES,
     MIN_WRITE_TOKEN_LEN,
     NOTE_ID_MAX_LEN,
     READER_URL_MAX_LEN,
+    WALLPAPER_FILENAME_MAX_LEN,
+    WALLPAPER_ID_MAX_LEN,
+    WALLPAPER_NO_FILENAME,
+    WALLPAPER_TARGETS,
+    WALLPAPER_TARGET_PRIMARY,
+    WALLPAPER_TARGET_SET,
     base64UrlEncode,
     bookKey,
     booksIndexKey,
@@ -43,11 +51,17 @@ import {
     parseByteRange,
     parsePath,
     renderBooksManifest,
+    renderWallpaperManifest,
     requestBodyLimit,
     sanitizeBookFilename,
+    sanitizeWallpaperFilename,
     timingSafeEqualStr,
     trimNoteId,
     validateBookId,
+    validateWallpaperId,
+    validateWallpaperTarget,
+    wallpaperKey,
+    wallpapersIndexKey,
     writeAuthPreflight,
 } from '../mailbox/src/core.js';
 
@@ -172,9 +186,16 @@ test('status reports the pointer, and 200s with nulls on an empty box', async ()
     const store = createMemoryStore();
     const empty = await call(store, req('GET', `/m/${BOX}/status`, { headers: { authorization: `Bearer ${TOKEN}` } }));
     assert.equal(empty.status, 200);
-    // `books` is additive: an empty ARRAY, never absent, so the app never has to
-    // distinguish "no books" from "a mailbox that predates the books route".
-    assert.deepEqual(asJson(empty), { latestId: null, bytes: 0, updatedAt: null, books: [] });
+    // `books` and `wallpapers` are additive: an empty ARRAY, never absent, so
+    // the app never has to distinguish "none" from "a mailbox that predates the
+    // route".
+    assert.deepEqual(asJson(empty), {
+        latestId: null,
+        bytes: 0,
+        updatedAt: null,
+        books: [],
+        wallpapers: [],
+    });
 
     await publish(store, 'n1', frame(1), { now: () => 0 });
     const full = await call(store, req('GET', `/m/${BOX}/status`, { headers: { authorization: `Bearer ${TOKEN}` } }));
@@ -183,6 +204,7 @@ test('status reports the pointer, and 200s with nulls on an empty box', async ()
         bytes: FRAME_BYTES,
         updatedAt: '1970-01-01T00:00:00.000Z',
         books: [],
+        wallpapers: [],
     });
 });
 
@@ -1723,6 +1745,10 @@ test('a books-only box still answers the note routes the way the firmware needs'
         bytes: 0,
         updatedAt: null,
         books: [{ id: 'bk-1', filename: 'Dune.epub', bytes: 100 }],
+        // Additive: a box that has never held a wallpaper still reports the key,
+        // empty. The app reads this to show "queued" state and must not have to
+        // special-case its absence on an old box.
+        wallpapers: [],
     });
 });
 
@@ -1814,13 +1840,27 @@ test('the preflight is required exactly where the body cap exceeds the notes cap
     // where an unauthenticated oversize body must keep answering 413, not 401.
     assert.ok(requestBodyLimit('POST', `/m/${BOX}/books`).bytes > MAX_REQUEST_BODY_BYTES);
     assert.equal(requestBodyLimit('POST', `/m/${BOX}/books`).bytes, MAX_BOOK_BYTES);
-    for (const path of [`/m/${BOX}/publish`, `/m/${BOX}/books/bk-1`, `/m/${BOX}/status`, '/nonsense']) {
+    // `POST /wallpaper` is on the SAME side of the predicate, which is how it
+    // inherits auth-before-buffering in both adapters without either of them
+    // learning a new route name.
+    assert.ok(requestBodyLimit('POST', `/m/${BOX}/wallpaper`).bytes > MAX_REQUEST_BODY_BYTES);
+    assert.equal(requestBodyLimit('POST', `/m/${BOX}/wallpaper`).bytes, MAX_WALLPAPER_BYTES);
+    assert.equal(requestBodyLimit('POST', `/m/${BOX}/wallpaper`).error, 'wallpaper_too_large');
+    for (const path of [
+        `/m/${BOX}/publish`,
+        `/m/${BOX}/books/bk-1`,
+        `/m/${BOX}/status`,
+        `/m/${BOX}/wallpaper/wp-1`,
+        `/m/${BOX}/wallpaper.txt`,
+        '/nonsense',
+    ]) {
         assert.equal(requestBodyLimit('POST', path).bytes, MAX_REQUEST_BODY_BYTES, path);
     }
-    // Only POST raises the cap: no other method reaches the books upload route,
+    // Only POST raises the cap: no other method reaches either upload route,
     // so none of them may skip straight past the notes bound either.
     for (const method of ['PUT', 'PATCH', 'GET', 'DELETE']) {
         assert.equal(requestBodyLimit(method, `/m/${BOX}/books`).bytes, MAX_REQUEST_BODY_BYTES, method);
+        assert.equal(requestBodyLimit(method, `/m/${BOX}/wallpaper`).bytes, MAX_REQUEST_BODY_BYTES, method);
     }
 });
 
@@ -1831,10 +1871,21 @@ test('a HEAD carries the Content-Length its GET would have, on every sized route
     const store = rangedStore();
     assert.equal((await postBook(store, 'bk-1', 'Dune.epub', epub(5000))).status, 200);
     assert.equal((await publish(store, 'n1', frame(1))).status, 200);
+    assert.equal((await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(3000))).status, 200);
 
     for (const [label, get, head] of [
         ['book', await getBook(store, 'bk-1'), await getBook(store, 'bk-1', { method: 'HEAD' })],
         ['manifest', await manifest(store), await manifest(store, { method: 'HEAD' })],
+        [
+            'wallpaper',
+            await getWallpaper(store, 'wp-1'),
+            await getWallpaper(store, 'wp-1', { method: 'HEAD' }),
+        ],
+        [
+            'wallpaper manifest',
+            await wallpaperManifest(store),
+            await wallpaperManifest(store, { method: 'HEAD' }),
+        ],
         [
             'frame',
             await call(store, req('GET', `/m/${BOX}/current.frame`)),
@@ -1857,4 +1908,1005 @@ test('a HEAD carries the Content-Length its GET would have, on every sized route
     assert.equal(partial.status, 206);
     assert.equal(partial.headers['content-length'], '1000');
     assert.equal(partial.headers['content-range'], 'bytes 1000-1999/5000');
+});
+
+// ===========================================================================
+// WALLPAPERS — sleep-screen delivery over the same mailbox
+//
+// Wallpaper used to be direct-LAN only: the app pushed a BMP straight at the
+// reader's /sleep.bmp while both were on one network and the reader was awake.
+// These routes make it travel the way notes and books already do. As with
+// books, the reader-side half is a FUTURE firmware milestone, so these tests
+// are the only definition of the contract it will be built against.
+//
+// The differences from books are exactly three, and each one has its own test
+// below: an entry carries a TARGET, a primary SUPERSEDES the pending primary,
+// and the manifest is rendered NEWEST LAST.
+// ===========================================================================
+
+/** Deterministic, seed-distinguishable "BMP". Not a real bitmap; this is a byte pipe. */
+function bmp(bytes, seed = 1) {
+    const out = new Uint8Array(bytes);
+    for (let i = 0; i < bytes; i++) out[i] = (i * 13 + seed * 37) & 0xff;
+    return out;
+}
+
+function wallpaperPostRequest(id, target, filename, body, { token = TOKEN, box = BOX, extraHeaders = {} } = {}) {
+    const headers = { 'content-type': 'application/octet-stream', ...extraHeaders };
+    if (token !== null) headers.authorization = `Bearer ${token}`;
+    if (id !== undefined) headers['x-wallpaper-id'] = id;
+    if (target !== undefined) headers['x-wallpaper-target'] = target;
+    if (filename !== undefined) headers['x-filename'] = filename;
+    return req('POST', `/m/${box}/wallpaper`, { headers, body });
+}
+
+function postWallpaper(store, id, target, filename, body, opts = {}) {
+    return call(store, wallpaperPostRequest(id, target, filename, body, opts), {
+        writeToken: TOKEN,
+        now: opts.now,
+    });
+}
+
+function getWallpaper(store, id, { range = null, method = 'GET', box = BOX } = {}) {
+    const headers = {};
+    if (range !== null) headers.range = range;
+    return call(store, req(method, `/m/${box}/wallpaper/${id}`, { headers }));
+}
+
+function deleteWallpaper(store, id, { token = TOKEN, box = BOX } = {}) {
+    const headers = token === null ? {} : { authorization: `Bearer ${token}` };
+    return call(store, req('DELETE', `/m/${box}/wallpaper/${id}`, { headers }));
+}
+
+function wallpaperManifest(store, { box = BOX, method = 'GET' } = {}) {
+    return call(store, req(method, `/m/${box}/wallpaper.txt`, {}));
+}
+
+/** Every line of a manifest, LF-terminated entries only. */
+function lines(body) {
+    return body.split('\n').filter((line) => line.length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Manifest: the bytes the reader applies, IN ORDER
+// ---------------------------------------------------------------------------
+
+test('wallpaper.txt is byte-exact: "{id} {bytes} {target} {filename}\\n", NEWEST LAST', async () => {
+    const store = createMemoryStore();
+
+    // Nothing pending is a ZERO-LENGTH 200, never a 404 — the reader syncs on
+    // every wake and a non-200 would be logged as a failed sync every time.
+    const empty = await wallpaperManifest(store);
+    assert.equal(empty.status, 200);
+    assert.equal(empty.headers['content-type'], 'text/plain; charset=utf-8');
+    assert.equal(text(empty), '');
+    assert.equal(empty.headers['content-length'], '0');
+
+    assert.equal((await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', bmp(1000, 1))).status, 200);
+    assert.equal((await postWallpaper(store, 'wp-2', 'set', 'Deep Sea.bmp', bmp(2048, 2))).status, 200);
+    assert.equal((await postWallpaper(store, 'wp-3', 'primary', undefined, bmp(4096, 3))).status, 200);
+
+    const res = await wallpaperManifest(store);
+    assert.equal(res.status, 200);
+    // NEWEST LAST — the opposite of books.txt, and the whole reason the target
+    // field is usable: a reader applies these in order and the last write to
+    // /sleep.bmp wins, so draining the manifest must END on the newest primary.
+    // Newest-first would end on the oldest and silently show a stale screen.
+    assert.equal(
+        text(res),
+        'wp-1 1000 set Forest.bmp\nwp-2 2048 set Deep Sea.bmp\nwp-3 4096 primary -\n'
+    );
+    assert.equal(res.headers['content-length'], String(text(res).length));
+    assert.match(res.headers['cache-control'], /no-store/);
+
+    // Four space-separated fields; the filename is the REST of the line, so a
+    // name containing a space still round-trips.
+    const setLine = lines(text(res))[1];
+    assert.equal(setLine.split(' ', 3).join(' '), 'wp-2 2048 set');
+    assert.equal(setLine.slice('wp-2 2048 set '.length), 'Deep Sea.bmp');
+
+    // A primary carries the literal "-" placeholder, never an empty field —
+    // an empty fourth field would move the LF into it and break a positional
+    // parser walking a C string.
+    const primaryLine = lines(text(res))[2];
+    assert.equal(primaryLine.split(' ')[3], WALLPAPER_NO_FILENAME);
+    assert.equal(primaryLine.split(' ').length, 4);
+
+    // No auth: the boxId is the read capability, exactly as for latest.txt.
+    assert.equal((await wallpaperManifest(store)).status, 200);
+});
+
+test('renderWallpaperManifest takes the stored order and emits the wire order', () => {
+    // The ONE place the reversal lives. Input is newest-first (the stored
+    // order, shared with the books index so eviction is the same three lines);
+    // output is newest-last.
+    assert.equal(renderWallpaperManifest([]), '');
+    assert.equal(
+        renderWallpaperManifest([{ id: 'a', bytes: 1, target: 'primary', filename: null }]),
+        'a 1 primary -\n'
+    );
+    assert.equal(
+        renderWallpaperManifest([
+            { id: 'newest', bytes: 3, target: 'primary', filename: null },
+            { id: 'middle', bytes: 2, target: 'set', filename: 'y z.bmp' },
+            { id: 'oldest', bytes: 1, target: 'set', filename: 'x.bmp' },
+        ]),
+        'oldest 1 set x.bmp\nmiddle 2 set y z.bmp\nnewest 3 primary -\n'
+    );
+});
+
+test('a corrupt wallpaper manifest degrades to empty, and can never forge a line', async () => {
+    // Same reasoning as the books manifest: nothing pending is a normal wake, a
+    // 500 is a logged error on every one. The round-trip checks are what stop a
+    // stored value from emitting a line this contract would not mint.
+    const encoder = new TextEncoder();
+    for (const junk of [
+        '',
+        'not json',
+        '{}',
+        '{"wallpapers":"nope"}',
+        '[1,2,3]',
+        '{"v":1,"books":[{"id":"ok","bytes":5,"filename":"a.bmp"}]}', // wrong array name
+        // An LF in a filename would turn one entry into two, naming bytes that
+        // do not exist.
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"set","filename":"a.bmp\\nforged 9 set evil.bmp"}]}',
+        '{"v":1,"wallpapers":[{"id":"has space","bytes":5,"target":"set","filename":"a.bmp"}]}',
+        '{"v":1,"wallpapers":[{"id":"..","bytes":5,"target":"set","filename":"a.bmp"}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"set","filename":"../../etc/passwd.bmp"}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"set","filename":"no-extension"}]}',
+        // A target outside the enum would tell the reader to write somewhere
+        // this contract does not define.
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"root","filename":"a.bmp"}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"PRIMARY","filename":null}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"filename":"a.bmp"}]}', // no target at all
+        // A `set` with no filename has nowhere to land; a `primary` WITH one has
+        // two candidate destinations.
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"set","filename":null}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"primary","filename":"a.bmp"}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":5,"target":"primary","filename":"-"}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":0,"target":"primary","filename":null}]}',
+        '{"v":1,"wallpapers":[{"id":"ok","bytes":-1,"target":"primary","filename":null}]}',
+        `{"v":1,"wallpapers":[{"id":"ok","bytes":${MAX_WALLPAPER_BYTES + 1},"target":"primary","filename":null}]}`,
+    ]) {
+        const store = createMemoryStore();
+        await store.put(wallpapersIndexKey(BOX), encoder.encode(junk));
+        const res = await wallpaperManifest(store);
+        assert.equal(res.status, 200, junk);
+        assert.equal(text(res), '', junk);
+        // Nothing the manifest does not name is reachable.
+        assert.equal((await getWallpaper(store, 'ok')).status, 404, junk);
+    }
+});
+
+test('a corrupt index cannot advertise two primaries or an unbounded manifest', async () => {
+    const encoder = new TextEncoder();
+
+    // Stored order is newest first, so the FIRST primary is the newest one and
+    // any later one is a corrupted leftover. Advertising both would cost the
+    // reader a wasted ~1.1 MB download inside a battery-budgeted wake window,
+    // for bytes it is about to overwrite.
+    const twoPrimaries = {
+        v: 1,
+        wallpapers: [
+            { id: 'new', bytes: 10, target: 'primary', filename: null },
+            { id: 'mid', bytes: 20, target: 'set', filename: 'keep.bmp' },
+            { id: 'old', bytes: 30, target: 'primary', filename: null },
+        ],
+    };
+    const store = createMemoryStore();
+    await store.put(wallpapersIndexKey(BOX), encoder.encode(JSON.stringify(twoPrimaries)));
+    assert.equal(text(await wallpaperManifest(store)), 'mid 20 set keep.bmp\nnew 10 primary -\n');
+
+    // And a hand-edited or corrupted index must not make the reader download a
+    // hundred-line manifest on every wake.
+    const many = [];
+    for (let i = 0; i < MAX_WALLPAPERS * 5; i++) {
+        many.push({ id: `w${i}`, bytes: 10, target: 'set', filename: `f${i}.bmp` });
+    }
+    const big = createMemoryStore();
+    await big.put(wallpapersIndexKey(BOX), encoder.encode(JSON.stringify({ v: 1, wallpapers: many })));
+    const got = lines(text(await wallpaperManifest(big)));
+    assert.equal(got.length, MAX_WALLPAPERS);
+    // Newest-last on the wire: the kept slice is the head of the stored array
+    // (the newest MAX_WALLPAPERS), emitted in reverse.
+    assert.equal(got[got.length - 1], 'w0 10 set f0.bmp');
+    assert.equal(got[0], `w${MAX_WALLPAPERS - 1} 10 set f${MAX_WALLPAPERS - 1}.bmp`);
+});
+
+// ---------------------------------------------------------------------------
+// Round trip and Range — the same resume mechanism books use
+// ---------------------------------------------------------------------------
+
+test('a published wallpaper downloads byte-exactly, and advertises Accept-Ranges', async () => {
+    const store = createMemoryStore();
+    const sent = bmp(4096, 7);
+    const posted = await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', sent);
+    assert.deepEqual(asJson(posted), {
+        ok: true,
+        id: 'wp-1',
+        target: 'set',
+        filename: 'Forest.bmp',
+        bytes: 4096,
+    });
+
+    const got = await getWallpaper(store, 'wp-1');
+    assert.equal(got.status, 200);
+    assert.equal(got.headers['content-type'], 'image/bmp');
+    assert.equal(got.headers['content-length'], '4096');
+    assert.equal(got.headers['accept-ranges'], 'bytes');
+    assert.equal(got.headers['content-disposition'], 'attachment; filename="Forest.bmp"');
+    assert.equal(got.headers['content-range'], undefined);
+    assert.deepEqual(got.body, sent);
+
+    // A primary has no filename to disclose: its destination is fixed at
+    // /sleep.bmp, so naming one here would invent a name the reader must not
+    // use. Omitting the header is the honest answer.
+    const primary = bmp(2048, 9);
+    assert.equal((await postWallpaper(store, 'wp-2', 'primary', undefined, primary)).status, 200);
+    const gotPrimary = await getWallpaper(store, 'wp-2');
+    assert.equal(gotPrimary.status, 200);
+    assert.equal(gotPrimary.headers['content-disposition'], undefined);
+    assert.deepEqual(gotPrimary.body, primary);
+
+    // No auth on the read path; an unknown id is 404.
+    assert.equal((await getWallpaper(store, 'nope')).status, 404);
+});
+
+test('a wallpaper resumes across windows exactly the way a book does', async () => {
+    // A 1056-long-side 8bpp BMP is ~1.1 MB and an ESP32 wake window is seconds
+    // long, so this is a multi-window download and the slices must re-assemble
+    // byte-for-byte. An off-by-one produces a corrupt sleep screen the reader
+    // has no way to detect.
+    const store = createMemoryStore();
+    const sent = bmp(9999, 5);
+    await postWallpaper(store, 'wp-1', 'primary', undefined, sent);
+
+    const mid = await getWallpaper(store, 'wp-1', { range: 'bytes=4096-8191' });
+    assert.equal(mid.status, 206);
+    assert.equal(mid.headers['content-range'], 'bytes 4096-8191/9999');
+    assert.equal(mid.headers['content-length'], '4096');
+    assert.equal(mid.headers['accept-ranges'], 'bytes');
+    assert.deepEqual(mid.body, sent.subarray(4096, 8192));
+
+    // Three bounded windows, the way the reader will actually do it.
+    const windowSize = 4000;
+    const chunks = [];
+    let have = 0;
+    while (have < sent.byteLength) {
+        const res = await getWallpaper(store, 'wp-1', { range: `bytes=${have}-${have + windowSize - 1}` });
+        assert.equal(res.status, 206, `at offset ${have}`);
+        // The TOTAL in Content-Range is what a reader compares against the
+        // `bytes` it read from wallpaper.txt, so it can restart if the id was
+        // re-published underneath it.
+        assert.match(res.headers['content-range'], new RegExp(`/${sent.byteLength}$`));
+        chunks.push(res.body);
+        have += res.body.byteLength;
+    }
+    assert.equal(chunks.length, 3);
+    const joined = new Uint8Array(sent.byteLength);
+    let at = 0;
+    for (const chunk of chunks) {
+        joined.set(chunk, at);
+        at += chunk.byteLength;
+    }
+    assert.deepEqual(joined, sent);
+
+    // Open-ended and suffix ranges, which is how a client resumes without
+    // knowing the total.
+    const tail = await getWallpaper(store, 'wp-1', { range: 'bytes=9000-' });
+    assert.equal(tail.status, 206);
+    assert.equal(tail.headers['content-range'], 'bytes 9000-9998/9999');
+    assert.deepEqual(tail.body, sent.subarray(9000));
+
+    // A last-byte-pos past the end is CLAMPED, not refused, so a fixed window
+    // size needs no prior knowledge of the length.
+    const clamped = await getWallpaper(store, 'wp-1', { range: 'bytes=9990-999999' });
+    assert.equal(clamped.status, 206);
+    assert.equal(clamped.headers['content-range'], 'bytes 9990-9998/9999');
+});
+
+test('an unsatisfiable wallpaper Range is 416 with the total size', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(500, 1));
+    for (const range of ['bytes=500-', 'bytes=9999-', 'bytes=400-300', 'bytes=-0']) {
+        const res = await getWallpaper(store, 'wp-1', { range });
+        assert.equal(res.status, 416, range);
+        // WITHOUT the total the client has nothing to correct its offset to and
+        // would retry the same bad range on every wake, forever.
+        assert.equal(res.headers['content-range'], 'bytes */500', range);
+        assert.equal(res.headers['accept-ranges'], 'bytes', range);
+    }
+    // A Range this server does not honour is IGNORED -> 200 full body, never a
+    // 416, so a client that sent one speculatively still gets its bytes.
+    for (const range of ['items=0-1', 'bytes=0-1,4-5', 'garbage', 'bytes=-']) {
+        const res = await getWallpaper(store, 'wp-1', { range });
+        assert.equal(res.status, 200, range);
+        assert.equal(res.headers['content-range'], undefined, range);
+        assert.equal(res.body.byteLength, 500, range);
+    }
+});
+
+test('a wallpaper store WITH stat+getRange serves the same bytes as one without', async () => {
+    // Two implementations of one range: slice-a-full-get (KV, the memory store)
+    // and read-the-window (the dev server's file store). A reader resuming
+    // across wake windows must get identical bytes from either.
+    const sent = bmp(8192, 11);
+    const plain = createMemoryStore();
+    const ranged = rangedStore();
+    for (const store of [plain, ranged]) {
+        assert.equal((await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', sent)).status, 200);
+    }
+    for (const range of [null, 'bytes=0-1023', 'bytes=4096-', 'bytes=-256', 'bytes=8191-8191']) {
+        const a = await getWallpaper(plain, 'wp-1', { range });
+        const b = await getWallpaper(ranged, 'wp-1', { range });
+        assert.equal(b.status, a.status, String(range));
+        assert.equal(b.headers['content-range'], a.headers['content-range'], String(range));
+        assert.equal(b.headers['content-length'], a.headers['content-length'], String(range));
+        assert.deepEqual(b.body, a.body, String(range));
+    }
+    // The ranged store really did read only the window it was asked for, which
+    // is the whole point: the dev server runs under MemoryMax=256M.
+    assert.ok(ranged.reads.length > 0);
+    assert.ok(
+        ranged.reads.every((read) => read.length <= sent.byteLength),
+        JSON.stringify(ranged.reads)
+    );
+    assert.deepEqual(
+        ranged.reads.find((read) => read.start === 4096),
+        { key: wallpaperKey(BOX, 'wp-1'), start: 4096, length: 4096 }
+    );
+});
+
+// ---------------------------------------------------------------------------
+// Retention: primary supersede, and oldest-evicted for the set
+// ---------------------------------------------------------------------------
+
+test('a new primary SUPERSEDES the pending one — index entry and blob', async () => {
+    // Two pending primaries would make the reader spend a whole wake window
+    // downloading ~1.1 MB it is about to overwrite, to end up exactly where the
+    // newest one alone would have put it.
+    const store = createMemoryStore();
+    assert.equal((await postWallpaper(store, 'wp-old', 'primary', undefined, bmp(1000, 1))).status, 200);
+    assert.equal((await postWallpaper(store, 'wp-new', 'primary', undefined, bmp(2000, 2))).status, 200);
+
+    assert.equal(text(await wallpaperManifest(store)), 'wp-new 2000 primary -\n');
+    // The superseded blob is really gone, not merely unadvertised.
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-old')), false);
+    assert.equal((await getWallpaper(store, 'wp-old')).status, 404);
+    assert.equal((await getWallpaper(store, 'wp-new')).status, 200);
+
+    // A `set` in between is NOT disturbed: it lands in a different file under
+    // /.sleep and is still wanted.
+    assert.equal((await postWallpaper(store, 'wp-set', 'set', 'Forest.bmp', bmp(300, 3))).status, 200);
+    assert.equal((await postWallpaper(store, 'wp-3rd', 'primary', undefined, bmp(400, 4))).status, 200);
+    assert.equal(
+        text(await wallpaperManifest(store)),
+        'wp-set 300 set Forest.bmp\nwp-3rd 400 primary -\n'
+    );
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-new')), false);
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-set')), true);
+});
+
+test('set wallpapers do NOT supersede each other, even under one filename', async () => {
+    // Unlike books, a wallpaper is applied and forgotten with an id-based
+    // done-state — there is no filename diff to make unresolvable, so two
+    // entries naming one file are merely applied in order and the newest wins.
+    // Collapsing them would silently drop an item the caller asked to queue.
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-a', 'set', 'Forest.bmp', bmp(100, 1));
+    await postWallpaper(store, 'wp-b', 'set', 'Forest.bmp', bmp(200, 2));
+    assert.equal(
+        text(await wallpaperManifest(store)),
+        'wp-a 100 set Forest.bmp\nwp-b 200 set Forest.bmp\n'
+    );
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-a')), true);
+});
+
+test('the 9th wallpaper evicts the oldest, and its bytes are really gone', async () => {
+    const store = createMemoryStore();
+    for (let i = 0; i < MAX_WALLPAPERS; i++) {
+        assert.equal((await postWallpaper(store, `wp-${i}`, 'set', `w${i}.bmp`, bmp(64, i))).status, 200);
+    }
+    assert.equal(lines(text(await wallpaperManifest(store))).length, MAX_WALLPAPERS);
+    assert.equal(lines(text(await wallpaperManifest(store)))[0], 'wp-0 64 set w0.bmp');
+
+    assert.equal((await postWallpaper(store, 'wp-new', 'set', 'new.bmp', bmp(64, 99))).status, 200);
+    const after = lines(text(await wallpaperManifest(store)));
+    assert.equal(after.length, MAX_WALLPAPERS);
+    // The oldest is gone from the front of the wire order, the newest is at the
+    // back, and the evicted blob went with the entry.
+    assert.equal(after[0], 'wp-1 64 set w1.bmp');
+    assert.equal(after[after.length - 1], 'wp-new 64 set new.bmp');
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-0')), false);
+    assert.equal((await getWallpaper(store, 'wp-0')).status, 404);
+});
+
+test('re-posting the same wallpaper id replaces the bytes without collecting them', async () => {
+    // That is what a retry does. The id stays in place, the blob is overwritten.
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', bmp(100, 1));
+    const replacement = bmp(250, 2);
+    assert.equal((await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', replacement)).status, 200);
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 250 set Forest.bmp\n');
+    assert.deepEqual((await getWallpaper(store, 'wp-1')).body, replacement);
+
+    // Re-posting the same id with a DIFFERENT target moves it, and does not
+    // leave a second entry behind.
+    assert.equal((await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(300, 3))).status, 200);
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 300 primary -\n');
+});
+
+test('a store with no delete() still publishes wallpapers; blobs simply accumulate', async () => {
+    // `delete` is optional on the store contract. Without it a superseded
+    // primary leaks its bytes, which is a cost, never a correctness problem —
+    // and it must never turn a delivered wallpaper into a reported failure.
+    const inner = createMemoryStore();
+    const store = { map: inner.map, get: (k) => inner.get(k), put: (k, v) => inner.put(k, v) };
+    assert.equal((await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1))).status, 200);
+    assert.equal((await postWallpaper(store, 'wp-2', 'primary', undefined, bmp(200, 2))).status, 200);
+    assert.equal(text(await wallpaperManifest(store)), 'wp-2 200 primary -\n');
+    // Orphaned but harmless: nothing the manifest does not name is reachable.
+    assert.equal(inner.map.has(wallpaperKey(BOX, 'wp-1')), true);
+    assert.equal((await getWallpaper(store, 'wp-1')).status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// Caps
+// ---------------------------------------------------------------------------
+
+test('a wallpaper over MAX_WALLPAPER_BYTES is 413, and exactly at the cap is accepted', async () => {
+    const store = createMemoryStore();
+    const over = await postWallpaper(store, 'wp-1', 'primary', undefined, new Uint8Array(MAX_WALLPAPER_BYTES + 1));
+    assert.equal(over.status, 413);
+    assert.equal(asJson(over).error, 'wallpaper_too_large');
+    assert.equal(store.map.size, 0, 'a refused wallpaper must not reach the store');
+
+    const at = await postWallpaper(store, 'wp-1', 'primary', undefined, new Uint8Array(MAX_WALLPAPER_BYTES));
+    assert.equal(at.status, 200);
+    assert.equal(asJson(at).bytes, MAX_WALLPAPER_BYTES);
+});
+
+test('the wallpaper cap is KV-safe and sized for the panel, and leaves the other caps alone', () => {
+    // 4 MiB. A 1056-long-side 8bpp BMP is ~1.1 MB, so this is ~4x headroom, and
+    // it is FAR under the 25 MiB Workers KV value ceiling — a body we accept is
+    // a body kv.put can store, which is the rule that stops the app reporting
+    // success for a wallpaper the reader can never see.
+    assert.equal(MAX_WALLPAPER_BYTES, 4 * 1024 * 1024);
+    assert.ok(MAX_WALLPAPER_BYTES < 25 * 1024 * 1024);
+    assert.ok(MAX_WALLPAPER_BYTES > 1_115_136 + 1078, 'must fit a full-bleed 1056px 8bpp BMP with headroom');
+    // And it changes neither of the caps that were already load-bearing.
+    assert.equal(MAX_REQUEST_BODY_BYTES, 64 * 1024);
+    assert.equal(MAX_BOOK_BYTES, 24 * 1024 * 1024);
+    assert.equal(MAX_WALLPAPERS, 8);
+});
+
+test('an empty wallpaper body is 400 — a zero-byte image would 416 every range forever', async () => {
+    const store = createMemoryStore();
+    const res = await postWallpaper(store, 'wp-1', 'primary', undefined, new Uint8Array(0));
+    assert.equal(res.status, 400);
+    assert.equal(store.map.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Auth — the same matrix books answer
+// ---------------------------------------------------------------------------
+
+test('POST and DELETE need the bearer token; wallpaper.txt and downloads never do', async () => {
+    const store = createMemoryStore();
+
+    for (const [label, headers] of CREDENTIALS) {
+        const res = await call(
+            store,
+            req('POST', `/m/${BOX}/wallpaper`, {
+                headers: { ...headers, 'x-wallpaper-id': 'wp-1', 'x-wallpaper-target': 'primary' },
+                body: bmp(64),
+            })
+        );
+        assert.equal(res.status, 401, label);
+        assert.equal(res.headers['www-authenticate'], 'Bearer', label);
+        assert.equal(store.map.size, 0, `${label}: nothing may be stored on the way to a 401`);
+    }
+
+    assert.equal((await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(128))).status, 200);
+
+    // Reads are open — the boxId IS the read capability, exactly as for
+    // latest.txt and books.txt. The firmware sends no auth headers at all.
+    assert.equal((await wallpaperManifest(store)).status, 200);
+    assert.equal((await getWallpaper(store, 'wp-1')).status, 200);
+    assert.equal((await getWallpaper(store, 'wp-1', { method: 'HEAD' })).status, 200);
+
+    // DELETE is a write.
+    for (const [label, headers] of CREDENTIALS) {
+        const res = await call(store, req('DELETE', `/m/${BOX}/wallpaper/wp-1`, { headers }));
+        assert.equal(res.status, 401, label);
+    }
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 128 primary -\n');
+    assert.equal((await deleteWallpaper(store, 'wp-1')).status, 200);
+});
+
+test('an unset or weak write token fails CLOSED on the wallpaper write routes', async () => {
+    // A blank secret must never mean "anyone may publish": that would turn the
+    // box id, which travels in the reader's settings in clear, into a write
+    // capability for the sleep screen too.
+    for (const writeToken of ['', 'short', 'x'.repeat(MIN_WRITE_TOKEN_LEN - 1)]) {
+        const store = createMemoryStore();
+        const posted = await call(
+            store,
+            wallpaperPostRequest('wp-1', 'primary', undefined, bmp(64)),
+            { writeToken }
+        );
+        assert.equal(posted.status, 503, JSON.stringify(writeToken));
+        assert.equal(asJson(posted).error, 'not_configured');
+
+        const deleted = await call(
+            store,
+            req('DELETE', `/m/${BOX}/wallpaper/wp-1`, { headers: { authorization: `Bearer ${TOKEN}` } }),
+            { writeToken }
+        );
+        assert.equal(deleted.status, 503, JSON.stringify(writeToken));
+
+        // Reads still work: a misconfigured deploy must not take the reader's
+        // sync down, it must refuse to accept new writes.
+        assert.equal((await call(store, req('GET', `/m/${BOX}/wallpaper.txt`, {}), { writeToken })).status, 200);
+    }
+});
+
+test('writeAuthPreflight is identical to what POST /wallpaper would answer', async () => {
+    // The adapters call the preflight BEFORE buffering, so if its verdict could
+    // differ from the route's, a credentialed 4 MiB upload could be refused
+    // without ever being read.
+    for (const [label, headers] of CREDENTIALS) {
+        const denied = writeAuthPreflight(headers, { writeToken: TOKEN });
+        assert.ok(denied, label);
+        const viaRoute = await call(
+            createMemoryStore(),
+            req('POST', `/m/${BOX}/wallpaper`, {
+                headers: { ...headers, 'x-wallpaper-id': 'wp-1', 'x-wallpaper-target': 'primary' },
+                body: bmp(64),
+            })
+        );
+        assert.deepEqual(denied, viaRoute, `${label}: preflight and route must be indistinguishable`);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Headers: id, target, filename
+// ---------------------------------------------------------------------------
+
+test('a bad X-Wallpaper-Id is rejected, never truncated or sanitised', async () => {
+    const store = createMemoryStore();
+    for (const id of [
+        undefined, // header absent
+        '',
+        '   ',
+        '\t\r\n',
+        'a'.repeat(WALLPAPER_ID_MAX_LEN + 1),
+        'has space',
+        'has/slash',
+        'has\\backslash',
+        'per%cent',
+        'café',
+        '.', // would name the store key's own directory on a file-backed store
+        '..',
+        '...',
+    ]) {
+        const res = await postWallpaper(store, id, 'primary', undefined, bmp(100, 1));
+        assert.equal(res.status, 400, `id=${JSON.stringify(id)}`);
+    }
+    assert.equal(store.map.size, 0);
+
+    for (const id of ['a'.repeat(WALLPAPER_ID_MAX_LEN), 'has.dot', 'has~tilde', 'has_under-score.1']) {
+        assert.equal((await postWallpaper(store, id, 'primary', undefined, bmp(64, 1))).status, 200, id);
+    }
+
+    assert.deepEqual(validateWallpaperId('  wp-1\n'), { ok: true, id: 'wp-1' });
+    assert.equal(validateWallpaperId('.').ok, false);
+    assert.equal(validateWallpaperId('..').ok, false);
+    assert.equal(validateWallpaperId('....').ok, false);
+    assert.equal(validateWallpaperId('.a').ok, true, 'a leading dot is fine, all-dots is not');
+    assert.equal(validateWallpaperId('').ok, false);
+});
+
+test('X-Wallpaper-Target is a closed enum; an unknown value is 400, never a default', async () => {
+    // The target decides WHERE the reader writes the bytes. Defaulting an
+    // unrecognised value would overwrite a user's active sleep screen with
+    // something they meant to add to the rotation.
+    assert.deepEqual([...WALLPAPER_TARGETS], ['primary', 'set']);
+    assert.equal(WALLPAPER_TARGET_PRIMARY, 'primary');
+    assert.equal(WALLPAPER_TARGET_SET, 'set');
+
+    const store = createMemoryStore();
+    for (const target of [undefined, '', '  ', 'PRIMARY_', 'root', 'sleep', 'primary set', '0', 'null']) {
+        const res = await postWallpaper(store, 'wp-1', target, 'Forest.bmp', bmp(64, 1));
+        assert.equal(res.status, 400, `target=${JSON.stringify(target)}`);
+    }
+    assert.equal(store.map.size, 0);
+
+    // Trimmed and case-folded to the canonical lowercase form, which is what
+    // gets stored and echoed everywhere after.
+    assert.deepEqual(validateWallpaperTarget('  Primary \n'), { ok: true, target: 'primary' });
+    assert.deepEqual(validateWallpaperTarget('SET'), { ok: true, target: 'set' });
+    const posted = await postWallpaper(store, 'wp-1', ' Primary ', undefined, bmp(64, 1));
+    assert.equal(posted.status, 200);
+    assert.equal(asJson(posted).target, 'primary');
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 64 primary -\n');
+});
+
+test('X-Filename is REQUIRED for set and IGNORED for primary', async () => {
+    const store = createMemoryStore();
+
+    // A `set` with no name has nowhere to land under /.sleep.
+    const missing = await postWallpaper(store, 'wp-1', 'set', undefined, bmp(64, 1));
+    assert.equal(missing.status, 400);
+    assert.match(asJson(missing).detail, /X-Filename/);
+    assert.equal(store.map.size, 0);
+
+    // A primary has exactly one destination (/sleep.bmp), so honouring a name
+    // would create a second source of truth for where the bytes land. It is
+    // dropped rather than rejected — a caller that sends one is not wrong, it
+    // is just sending something with no meaning on this target.
+    const withName = await postWallpaper(store, 'wp-1', 'primary', 'Ignored.bmp', bmp(64, 1));
+    assert.equal(withName.status, 200);
+    assert.equal(asJson(withName).filename, null);
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 64 primary -\n');
+
+    // A primary is never rejected for a filename that a `set` would refuse,
+    // because the header is not read at all on that target.
+    assert.equal((await postWallpaper(store, 'wp-2', 'primary', '../../etc/passwd', bmp(64, 2))).status, 200);
+});
+
+test('a traversal or unsafe wallpaper X-Filename is REJECTED, not silently rewritten', async () => {
+    const store = createMemoryStore();
+    for (const filename of [
+        '',
+        '    ',
+        '../../etc/passwd.bmp',
+        '..\\..\\evil.bmp',
+        '/absolute.bmp',
+        'sub/dir/wall.bmp',
+        'sub\\dir\\wall.bmp',
+        '.bmp',
+        '..bmp',
+        '.hidden.bmp', // the reader's own /.sleep is ITS namespace
+        'wall.png',
+        'wall',
+        'wall.bmp.exe',
+        'forged.bmp\nwp-9 5 set evil.bmp',
+        'has\rcarriage.bmp',
+        'has\ttab.bmp',
+        'has\x00nul.bmp',
+        `${'a'.repeat(WALLPAPER_FILENAME_MAX_LEN)}.bmp`, // over the cap once .bmp is counted
+    ]) {
+        const res = await postWallpaper(store, 'wp-1', 'set', filename, bmp(100, 1));
+        assert.equal(res.status, 400, `filename=${JSON.stringify(filename)}`);
+    }
+    assert.equal(store.map.size, 0, 'no rejected filename may reach the store');
+});
+
+test('a merely awkward wallpaper X-Filename is sanitised, and the manifest stays ASCII', async () => {
+    assert.deepEqual(sanitizeWallpaperFilename('Forest.bmp'), { ok: true, filename: 'Forest.bmp' });
+    assert.deepEqual(sanitizeWallpaperFilename('  Forest.BMP \n'), { ok: true, filename: 'Forest.bmp' });
+    assert.deepEqual(sanitizeWallpaperFilename('A: Wall?.bmp'), { ok: true, filename: 'A_ Wall_.bmp' });
+    assert.deepEqual(sanitizeWallpaperFilename('Café Frappé.bmp'), { ok: true, filename: 'Caf_ Frapp_.bmp' });
+    assert.deepEqual(sanitizeWallpaperFilename('Spaced    out.bmp'), { ok: true, filename: 'Spaced out.bmp' });
+    assert.deepEqual(sanitizeWallpaperFilename(`${'a'.repeat(WALLPAPER_FILENAME_MAX_LEN - 4)}.bmp`), {
+        ok: true,
+        filename: `${'a'.repeat(WALLPAPER_FILENAME_MAX_LEN - 4)}.bmp`,
+    });
+
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'set', 'Café: Frappé*.BMP', bmp(100, 1));
+    const line = text(await wallpaperManifest(store));
+    assert.equal(line, 'wp-1 100 set Caf__ Frapp__.bmp\n');
+    // eslint-disable-next-line no-control-regex
+    assert.ok(/^[\x20-\x7e\n]*$/.test(line), 'a manifest line must be printable ASCII');
+    assert.equal(new TextEncoder().encode(line).byteLength, line.length);
+});
+
+test('a malformed wallpaper id in the URL is 404 and never becomes a store key', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+    const reads = [];
+    const watched = {
+        get: (key) => {
+            reads.push(key);
+            return store.get(key);
+        },
+        put: (key, value) => store.put(key, value),
+    };
+    for (const raw of ['..', '.', 'has%20space', 'a'.repeat(WALLPAPER_ID_MAX_LEN + 1), 'caf%C3%A9']) {
+        assert.equal((await call(watched, req('GET', `/m/${BOX}/wallpaper/${raw}`))).status, 404, raw);
+        const del = await call(
+            watched,
+            req('DELETE', `/m/${BOX}/wallpaper/${raw}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+        );
+        assert.equal(del.status, 404, raw);
+    }
+    assert.ok(
+        !reads.some((key) => key.includes('..') || key.includes('%')),
+        `no store key may be built from an unvalidated id: ${JSON.stringify(reads)}`
+    );
+});
+
+// ---------------------------------------------------------------------------
+// Delete, ordering, and storage faults
+// ---------------------------------------------------------------------------
+
+test('DELETE removes the wallpaper entry and the blob; deleting twice is 404', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', bmp(100, 1));
+    await postWallpaper(store, 'wp-2', 'primary', undefined, bmp(200, 2));
+
+    const res = await deleteWallpaper(store, 'wp-1');
+    assert.equal(res.status, 200);
+    assert.deepEqual(asJson(res), { ok: true, id: 'wp-1', target: 'set', filename: 'Forest.bmp' });
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-1')), false);
+    assert.equal(text(await wallpaperManifest(store)), 'wp-2 200 primary -\n');
+
+    assert.equal((await deleteWallpaper(store, 'wp-1')).status, 404);
+    assert.equal((await deleteWallpaper(store, 'never-existed')).status, 404);
+
+    // A deleted primary reports filename null, not "-".
+    const delPrimary = await deleteWallpaper(store, 'wp-2');
+    assert.deepEqual(asJson(delPrimary), { ok: true, id: 'wp-2', target: 'primary', filename: null });
+    assert.equal(text(await wallpaperManifest(store)), '');
+});
+
+test('wallpaper publish writes the BLOB first and the manifest second; delete does the reverse', async () => {
+    // The manifest must never advertise bytes that are absent — the reader
+    // budgets a whole wake window per download, and on KV the two keys
+    // replicate independently.
+    const store = instrumentedStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+    assert.deepEqual(store.puts, [wallpaperKey(BOX, 'wp-1'), wallpapersIndexKey(BOX)]);
+
+    store.puts.length = 0;
+    await deleteWallpaper(store, 'wp-1');
+    assert.deepEqual(store.puts, [wallpapersIndexKey(BOX)]);
+    assert.deepEqual(store.deletes, [wallpaperKey(BOX, 'wp-1')]);
+});
+
+test('a failed wallpaper manifest write reports published:false and changes nothing visible', async () => {
+    const store = instrumentedStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+
+    store.setBeforePut((key) => {
+        if (key === wallpapersIndexKey(BOX)) throw new Error('kv down');
+    });
+    const res = await postWallpaper(store, 'wp-2', 'primary', undefined, bmp(200, 2));
+    assert.equal(res.status, 503);
+    assert.equal(asJson(res).published, false);
+
+    store.setBeforePut(null);
+    // The old primary is still the pending one, and the orphaned blob is left
+    // in place DELIBERATELY: a put that threw may still have landed, and
+    // deleting it would turn a live wallpaper into a permanent 404.
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 100 primary -\n');
+    assert.equal(store.map.has(wallpaperKey(BOX, 'wp-2')), true);
+    assert.equal((await getWallpaper(store, 'wp-2')).status, 404);
+});
+
+test('a store whose reads throw does not take the wallpaper routes down', async () => {
+    const angry = {
+        async get() {
+            throw new Error('kv down');
+        },
+        async put() {},
+    };
+    // Nothing pending is a normal wake, so the manifest degrades rather than 500s.
+    const man = await call(angry, req('GET', `/m/${BOX}/wallpaper.txt`, {}));
+    assert.equal(man.status, 200);
+    assert.equal(text(man), '');
+    // A named download 404s: the manifest is what said it existed.
+    assert.equal((await call(angry, req('GET', `/m/${BOX}/wallpaper/wp-1`))).status, 404);
+    // /status still answers, with an empty list.
+    const status = await call(angry, req('GET', `/m/${BOX}/status`, { headers: { authorization: `Bearer ${TOKEN}` } }));
+    assert.equal(status.status, 200);
+    assert.deepEqual(asJson(status).wallpapers, []);
+});
+
+test('a wallpaper blob whose size disagrees with the manifest is refused, not served', async () => {
+    // A reader that stitched a short slice into /sleep.bmp gets a corrupt sleep
+    // screen and no way to know.
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(1000, 1));
+    await store.put(wallpaperKey(BOX, 'wp-1'), bmp(999, 1));
+
+    const res = await getWallpaper(store, 'wp-1');
+    assert.equal(res.status, 500);
+    assert.equal(asJson(res).error, 'corrupt_wallpaper');
+    assert.equal(asJson(res).bytes, 999);
+    assert.equal(asJson(res).expected, 1000);
+});
+
+test('the wallpaper routes are method-constrained', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+    const auth = { authorization: `Bearer ${TOKEN}` };
+
+    for (const method of ['GET', 'PUT', 'DELETE', 'PATCH']) {
+        const res = await call(store, req(method, `/m/${BOX}/wallpaper`, { headers: auth }));
+        assert.equal(res.status, 405, `${method} /wallpaper`);
+        assert.equal(res.headers.allow, 'POST', `${method} /wallpaper`);
+    }
+    for (const method of ['POST', 'PUT', 'PATCH']) {
+        const res = await call(store, req(method, `/m/${BOX}/wallpaper.txt`, { headers: auth }));
+        assert.equal(res.status, 405, `${method} /wallpaper.txt`);
+        assert.equal(res.headers.allow, 'GET, HEAD', `${method} /wallpaper.txt`);
+    }
+    for (const method of ['POST', 'PUT', 'PATCH']) {
+        const res = await call(store, req(method, `/m/${BOX}/wallpaper/wp-1`, { headers: auth }));
+        assert.equal(res.status, 405, `${method} /wallpaper/{id}`);
+        assert.equal(res.headers.allow, 'GET, HEAD, DELETE', `${method} /wallpaper/{id}`);
+    }
+});
+
+test('wallpaper paths are parsed structurally; a stray segment is 404', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+    for (const path of [
+        `/m/${BOX}/wallpaper/wp-1/extra`,
+        `/m/${BOX}/wallpaper.txt/extra`,
+        `/m/${BOX}/wallpaper/wp-1/../..`,
+        `/m/${BOX}/wallpapers`,
+        `/m/${BOX}/wallpapers.txt`,
+        `/m/${BOX}/sleep.bmp`,
+    ]) {
+        assert.equal((await call(store, req('GET', path))).status, 404, path);
+    }
+    // Trailing and duplicated slashes are still tolerated, exactly as elsewhere.
+    assert.equal((await call(store, req('GET', `/m/${BOX}/wallpaper.txt/`))).status, 200);
+    assert.equal((await call(store, req('GET', `//m/${BOX}//wallpaper/wp-1`))).status, 200);
+});
+
+test('boxes are isolated: a wallpaper published to one is invisible from the other', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+    assert.equal(text(await wallpaperManifest(store, { box: OTHER_BOX })), '');
+    assert.equal((await getWallpaper(store, 'wp-1', { box: OTHER_BOX })).status, 404);
+    assert.equal((await deleteWallpaper(store, 'wp-1', { box: OTHER_BOX })).status, 404);
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 100 primary -\n');
+});
+
+test('every wallpaper response is uncacheable', async () => {
+    // `no-store` is load-bearing, not hygiene: a cached wallpaper.txt would pin
+    // the reader on a stale pending list, and a cached 404 would outlive the
+    // publish that fixed it.
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+    for (const res of [
+        await wallpaperManifest(store),
+        await getWallpaper(store, 'wp-1'),
+        await getWallpaper(store, 'wp-1', { range: 'bytes=0-9' }),
+        await getWallpaper(store, 'wp-1', { range: 'bytes=999999-' }),
+        await getWallpaper(store, 'nope'),
+        await postWallpaper(store, 'wp-2', 'set', 'Forest.bmp', bmp(50, 2)),
+        await deleteWallpaper(store, 'wp-2'),
+    ]) {
+        assert.match(res.headers['cache-control'], /no-store/, String(res.status));
+        assert.equal(res.headers['x-content-type-options'], 'nosniff', String(res.status));
+    }
+});
+
+// ---------------------------------------------------------------------------
+// REGRESSION: notes and books are untouched — additive means additive
+// ---------------------------------------------------------------------------
+
+test('wallpapers share a box with notes and books without touching their keys', async () => {
+    const store = createMemoryStore();
+
+    await publish(store, 'note-1', frame(1));
+    await postBook(store, 'bk-1', 'Dune.epub', epub(500, 1));
+    await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', bmp(300, 1));
+    await publish(store, 'note-2', frame(2));
+    await postWallpaper(store, 'wp-2', 'primary', undefined, bmp(400, 2));
+    await postBook(store, 'bk-2', 'Hobbit.epub', epub(600, 2));
+
+    // Every note assertion still holds, unchanged.
+    assert.equal(text(await call(store, req('GET', `/m/${BOX}/latest.txt`))), 'note-2');
+    const gotFrame = await call(store, req('GET', `/m/${BOX}/current.frame`));
+    assert.equal(gotFrame.status, 200);
+    assert.equal(gotFrame.headers['content-type'], 'application/octet-stream');
+    assert.equal(gotFrame.headers['content-length'], String(FRAME_BYTES));
+    assert.deepEqual(gotFrame.body, frame(2));
+
+    // Every book assertion, including the newest-FIRST manifest order that
+    // wallpapers deliberately do not share.
+    assert.equal(text(await manifest(store)), 'bk-2 600 Hobbit.epub\nbk-1 500 Dune.epub\n');
+    assert.equal((await getBook(store, 'bk-1')).body.byteLength, 500);
+    assert.equal((await getBook(store, 'bk-1')).headers['content-type'], 'application/epub+zip');
+
+    // And the wallpaper one, newest LAST.
+    assert.equal(text(await wallpaperManifest(store)), 'wp-1 300 set Forest.bmp\nwp-2 400 primary -\n');
+
+    // The key set is exactly the notes keys PLUS the book keys PLUS the
+    // wallpaper keys — no existing key changed name, and no new key collides.
+    assert.deepEqual(
+        [...store.map.keys()].sort(),
+        [
+            metaKey(BOX),
+            frameKey(BOX, 'note-1'),
+            frameKey(BOX, 'note-2'),
+            booksIndexKey(BOX),
+            bookKey(BOX, 'bk-1'),
+            bookKey(BOX, 'bk-2'),
+            wallpapersIndexKey(BOX),
+            wallpaperKey(BOX, 'wp-1'),
+            wallpaperKey(BOX, 'wp-2'),
+        ].sort()
+    );
+
+    // The `:` -> `_` mapping the dev server's file store applies stays
+    // injective across all four namespaces (the id charset excludes `_`, so no
+    // id can spell `s_index`).
+    const flat = [...store.map.keys()].map((key) => key.replace(/:/g, '_'));
+    assert.equal(new Set(flat).size, flat.length);
+    assert.ok(flat.every((name) => /^[A-Za-z0-9._~-]+$/.test(name)), JSON.stringify(flat));
+
+    // Deleting every wallpaper leaves the notes and books sides intact.
+    await deleteWallpaper(store, 'wp-1');
+    await deleteWallpaper(store, 'wp-2');
+    assert.equal(text(await wallpaperManifest(store)), '');
+    assert.equal(text(await manifest(store)), 'bk-2 600 Hobbit.epub\nbk-1 500 Dune.epub\n');
+    assert.equal(text(await call(store, req('GET', `/m/${BOX}/latest.txt`))), 'note-2');
+    assert.deepEqual((await call(store, req('GET', `/m/${BOX}/current.frame`))).body, frame(2));
+
+    // And publishing a note still does not disturb either index.
+    await publish(store, 'note-3', frame(3));
+    assert.equal(text(await wallpaperManifest(store)), '');
+    assert.equal(text(await manifest(store)), 'bk-2 600 Hobbit.epub\nbk-1 500 Dune.epub\n');
+});
+
+test('a wallpapers-only box still answers the note and book routes correctly', async () => {
+    // The reader syncs notes on EVERY wake whether or not a wallpaper is
+    // pending. A box that has only ever held wallpapers must look like an empty
+    // mailbox with an empty library, not an error.
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'primary', undefined, bmp(100, 1));
+
+    const latest = await call(store, req('GET', `/m/${BOX}/latest.txt`));
+    assert.equal(latest.status, 200);
+    assert.equal(text(latest), '');
+    assert.equal((await call(store, req('GET', `/m/${BOX}/current.frame`))).status, 404);
+    assert.equal(text(await manifest(store)), '');
+
+    const status = await call(store, req('GET', `/m/${BOX}/status`, { headers: { authorization: `Bearer ${TOKEN}` } }));
+    assert.deepEqual(asJson(status), {
+        latestId: null,
+        bytes: 0,
+        updatedAt: null,
+        books: [],
+        wallpapers: [{ id: 'wp-1', target: 'primary', filename: null, bytes: 100 }],
+    });
+});
+
+test('/status reports wallpapers newest first, with a null filename for a primary', async () => {
+    const store = createMemoryStore();
+    await postWallpaper(store, 'wp-1', 'set', 'Forest.bmp', bmp(100, 1));
+    await postWallpaper(store, 'wp-2', 'primary', undefined, bmp(200, 2));
+
+    const status = await call(store, req('GET', `/m/${BOX}/status`, { headers: { authorization: `Bearer ${TOKEN}` } }));
+    // JSON gets null, not the "-" placeholder: "-" is a POSITIONAL token for a
+    // firmware line parser, and putting it here would invent a filename the
+    // reader must not use.
+    assert.deepEqual(asJson(status).wallpapers, [
+        { id: 'wp-2', target: 'primary', filename: null, bytes: 200 },
+        { id: 'wp-1', target: 'set', filename: 'Forest.bmp', bytes: 100 },
+    ]);
+    // Summary only — never the blobs.
+    assert.equal(text(status).includes('updatedAt'), true);
+
+    // And /status is a write-credentialed route, unchanged.
+    assert.equal((await call(store, req('GET', `/m/${BOX}/status`, { headers: {} }))).status, 401);
+});
+
+test('the notes body cap is still 64 KB even though wallpapers may be 4 MiB', async () => {
+    // The regression this guards is the one books already had: raising
+    // MAX_REQUEST_BODY_BYTES globally would let a bogus oversize /publish be
+    // buffered before the exact-size check rejects it.
+    const store = createMemoryStore();
+    assert.equal(requestBodyLimit('POST', `/m/${BOX}/publish`).bytes, MAX_REQUEST_BODY_BYTES);
+    assert.equal((await publish(store, 'n1', new Uint8Array(FRAME_BYTES + 1))).status, 413);
+    assert.equal((await publish(store, 'n1', frame(1))).status, 200);
+    assert.equal(text(await call(store, req('GET', `/m/${BOX}/latest.txt`))), 'n1');
 });

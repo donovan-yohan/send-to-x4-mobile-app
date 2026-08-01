@@ -2,23 +2,32 @@
 
 A small Cloudflare Worker that holds **one love-note frame** and **one note id**
 per mailbox (plus the immediately previous frame — see
-[storage layout](#storage-layout-and-publish-ordering)), and **up to 20 epubs**
-([books](#books-epub-delivery)). The CrossPoint reader (messenger fork) polls it at deep-sleep
-entry; the phone app publishes to it. It exists because the reader is invisible
-on the network while asleep — the phone cannot push to it, so something durable
-has to sit in the middle.
+[storage layout](#storage-layout-and-publish-ordering)), **up to 20 epubs**
+([books](#books-epub-delivery)) and **up to 8 pending sleep screens**
+([wallpapers](#wallpapers-sleep-screen-delivery)). The CrossPoint reader
+(messenger fork) polls it at deep-sleep entry; the phone app publishes to it. It
+exists because the reader is invisible on the network while asleep — the phone
+cannot push to it, so something durable has to sit in the middle.
 
 ```
- phone app  --POST /publish (bearer)-->  [ mailbox ]  <--GET /latest.txt------  reader
-            --POST /books   (bearer)-->               <--GET /current.frame---  (at deep-sleep entry)
-                                                      <--GET /books.txt-------
-                                                      <--GET /books/{id} ------  (Range: resume)
+ phone app  --POST /publish   (bearer)-->  [ mailbox ]  <--GET /latest.txt--------  reader
+            --POST /books     (bearer)-->               <--GET /current.frame-----  (at deep-sleep entry)
+            --POST /wallpaper (bearer)-->               <--GET /books.txt---------
+                                                        <--GET /books/{id}--------  (Range: resume)
+                                                        <--GET /wallpaper.txt-----
+                                                        <--GET /wallpaper/{id}----  (Range: resume)
 ```
 
 The point of all of it: **after one-time provisioning the reader never re-enters
-transfer mode.** Notes pull-sync today (hardware-proven); books ride the same
-mailbox, the same capability URL and the same token, so nothing new gets
-provisioned on the device when the reader-side milestone lands.
+transfer mode.** Notes pull-sync today (hardware-proven); books and wallpapers
+ride the same mailbox, the same capability URL and the same token, so nothing new
+gets provisioned on the device when the reader-side milestones land.
+
+Wallpaper used to be **direct-LAN only** (the app pushed a BMP straight at the
+reader's `/sleep.bmp` or `/.sleep/`), which meant it worked only while phone and
+reader shared a network *and* the reader was awake. Over the mailbox, a host can
+set the reader's sleep screen from anywhere and the reader collects it on its own
+sync windows.
 
 | file | role |
 |---|---|
@@ -64,7 +73,7 @@ the **write** path here, where the app can still see the error.
 |---|---|
 | `POST {base}/publish`<br>`Authorization: Bearer <writeToken>`<br>`Content-Type: application/octet-stream`<br>`X-Note-Id: <id>`<br>body = 52272 bytes | `200 {"ok":true,"id":…,"bytes":52272,"updatedAt":…}` |
 | | `401` bad/missing token · `400` bad id or wrong size · `413` body > one frame · `503` storage failure (`published:false`) |
-| `GET {base}/status` + bearer | `200 {"latestId":…, "bytes":…, "updatedAt":…, "books":[{id,filename,bytes}]}` (nulls/0/`[]` when empty) |
+| `GET {base}/status` + bearer | `200 {"latestId":…, "bytes":…, "updatedAt":…, "books":[{id,filename,bytes}], "wallpapers":[{id,target,filename,bytes}]}` (nulls/0/`[]` when empty) |
 
 `X-Note-Id`: trimmed exactly the way the firmware's `trimId()` trims (space, tab,
 CR, LF), then required to match `[A-Za-z0-9._~-]{1,64}`. Ids are **rejected, never
@@ -77,8 +86,9 @@ fetched at all, and a cached copy pins the reader on the old id.
 
 ### Storage layout and publish ordering
 
-Note keys per box, at most three (books add their own — see
-[books storage layout](#books-storage-layout-and-write-ordering)):
+Note keys per box, at most three (books and wallpapers add their own — see
+[books storage layout](#books-storage-layout-and-write-ordering) and
+[wallpaper storage layout](#wallpaper-storage-layout-and-write-ordering)):
 
 | key | holds |
 |---|---|
@@ -251,6 +261,157 @@ Workers costs one full value read — and why `MAX_BOOK_BYTES` is what KV can ho
 
 ---
 
+## Wallpapers (sleep-screen delivery)
+
+Additive again: **no note route, note key, book route or book key changed shape.**
+A box that has only ever held notes and books is byte-identical in the store to
+what it was before this route existed.
+
+Structurally these are the books routes, with **exactly three** differences:
+
+1. an entry carries a **target** telling the reader which file to write;
+2. a new `primary` **supersedes** the pending one instead of stacking;
+3. the manifest is rendered **newest last**.
+
+Everything else — ordering, eviction, GC, `Range`, auth placement, the
+degrade-to-empty read path — is the same code shape, because the books version
+is the one that has been reviewed against the firmware's wake-window behaviour.
+
+### Reader reads — **no auth** (the `boxId` is the capability, as above)
+
+| request | response |
+|---|---|
+| `GET {base}/wallpaper.txt` | `200 text/plain`, one line per pending wallpaper, **newest last**, zero-length body when nothing is pending |
+| `GET\|HEAD {base}/wallpaper/{id}` | `200 image/bmp` + `Accept-Ranges: bytes`; with a `Range` → `206` + `Content-Range`; unsatisfiable → `416` + `Content-Range: bytes */{size}` |
+
+**Manifest format is a byte-exact contract** (pinned by
+`scripts/mailbox-core.test.js`):
+
+```
+{id} {bytes} {target} {filename}\n
+```
+
+`target` is `primary` or `set`. `filename` is the literal **`-`** for every
+`primary` — a *positional placeholder*, not a name: the line is four
+space-separated fields and the parser takes the fourth as "the rest of the
+line", so an empty field would move the LF into it. `-` is unambiguous because a
+`set` filename must end in `.bmp` and therefore can never *be* `-`.
+
+Ids, byte counts and targets contain no spaces by construction, so a reader scans
+to the first three spaces and takes the remainder — a filename containing a space
+still round-trips. Filenames are forced to printable ASCII, same as books.
+
+**Newest LAST, the opposite of `books.txt`, and that is the point.** The reader
+applies these **in the order it reads them**, and the last write to `/sleep.bmp`
+wins. Newest-last means a reader that drains the whole manifest in one window
+*ends* on the newest primary; newest-first would end on the oldest and silently
+show a stale screen.
+
+### Reader-side application
+
+| target | destination |
+|---|---|
+| `primary` | `/sleep.bmp` — the active sleep screen |
+| `set` | `/.sleep/{filename}` — the rotation folder |
+
+The reader **tracks applied ids** so it never re-downloads one — the same
+done-state pattern `BookSync` uses. There are **no server-side acks** here
+either, for the reasons spelled out for books: reader-side state is
+authoritative, and an ack is a write the reader would have to make inside its
+wake window.
+
+`Range` behaves identically to books — see
+[that table](#range-is-the-resume-mechanism-not-an-optimisation); it is not an
+optimisation here either, since a full-bleed 8bpp BMP is ~1.1 MB and a wake
+window is seconds long.
+
+### App writes — **bearer auth** (the same `WRITE_TOKEN`)
+
+| request | response |
+|---|---|
+| `POST {base}/wallpaper`<br>`Authorization: Bearer <writeToken>`<br>`Content-Type: application/octet-stream`<br>`X-Wallpaper-Id: <id>`<br>`X-Wallpaper-Target: primary\|set`<br>`X-Filename: <name.bmp>`<br>body = 8-bit grayscale BMP | `200 {"ok":true,"id":…,"target":…,"filename":…,"bytes":…}` |
+| | `401` bad/missing token · `400` bad id/target/filename or empty body · `413` over the cap · `503` storage failure (`published:false`) |
+| `DELETE {base}/wallpaper/{id}` + bearer | `200 {"ok":true,"id":…,"target":…,"filename":…}` · `404` unknown id |
+
+- **`X-Wallpaper-Id`** — the note/book charset (`[A-Za-z0-9._~-]{1,64}`), `.` and
+  `..` refused. Same reason: it becomes a store key, and a store key becomes a
+  filesystem path on the dev server.
+- **`X-Wallpaper-Target`** — a closed two-member enum. Trimmed and case-folded to
+  the canonical lowercase form; anything else is **400, never a default**.
+  Defaulting an unrecognised value would overwrite a user's active sleep screen
+  with something they meant to add to the rotation.
+- **`X-Filename`** — **required** when `target=set`, **ignored** when
+  `target=primary` (not "optional"). A primary has exactly one destination, so
+  honouring a name there would create a second source of truth for where the
+  bytes land. Same reject/replace split as `X-Filename` on books, with `.bmp`
+  instead of `.epub`; the extension is lowercased so one image cannot become two
+  files on a case-insensitive card.
+
+**`filename` is `null` — not `"-"` — everywhere JSON is spoken** (the `POST`
+response, `DELETE`, and `/status`). The `-` exists only for the text manifest's
+positional parser; putting it in JSON would invent a filename the reader must
+not use.
+
+The body is **not** validated as a BMP. The mailbox is a byte pipe, exactly as it
+is for epubs — the encoder on the app side and the renderer on the reader side
+own the format.
+
+### Caps and retention
+
+| constant | value | why |
+|---|---|---|
+| `MAX_WALLPAPER_BYTES` | **4 MiB** (4194304) | A 1056-long-side 8bpp BMP is ~1.1 MB, so this is ~4x headroom for a larger source or a padded row stride, and it stays far under the 25 MiB Workers KV **value** ceiling. Same rule as books: a body we accept must be a body `kv.put` can store, or the app reports success for something the reader can never see. |
+| `MAX_WALLPAPERS` | **8** pending per box | Smaller than `MAX_BOOKS` because a wallpaper is applied and forgotten, not a library kept in sync — eight at ~1.1 MB is already more than a reader drains in one window. The 9th **evicts the oldest**, entry *and* blob. |
+| notes body cap | **64 KB**, unchanged | Unchanged, for the reason books did not change it either. |
+
+**Primary supersede.** Publishing `target=primary` **replaces** any earlier
+primary still in the index — entry and blob. Two pending primaries would make the
+reader spend a wake window downloading ~1.1 MB it is about to overwrite, to end
+up exactly where the newest one alone would have put it. At most one primary is
+ever pending, and that invariant is re-checked on **read**, so a corrupted index
+cannot break it either.
+
+`set` items do **not** supersede each other, **not even under the same
+filename** — unlike books. Books collapse same-filename entries because the
+reader's diff against its SD card would otherwise be unresolvable; a wallpaper
+has an id-based done-state and no filename diff, so collapsing them would
+silently drop an item the caller asked to queue. Re-POSTing the **same id** does
+replace, since that is what a retry is.
+
+### Wallpaper storage layout and write ordering
+
+| key | holds |
+|---|---|
+| `box:{id}:wallpapers:index` | `{v, wallpapers:[{id, target, filename, bytes, updatedAt}]}` — **newest first** in storage; the wire reversal happens in `renderWallpaperManifest`, the one place that knows about it |
+| `box:{id}:wallpaper:{wallpaperId}` | one BMP's bytes |
+
+Content-addressed by wallpaper id, for the reason frames and books are. The dev
+server's `:`→`_` filename mapping stays **injective across all four namespaces**:
+the id charset excludes `_`, so no id can spell `s_index` and turn
+`wallpaper:{id}` into `wallpapers_index`. Pinned by a test that flattens the
+whole key set of a mixed box and asserts uniqueness.
+
+- **publish: blob first, index second.** The manifest must never advertise bytes
+  that are absent.
+- **delete: index first, blob second.** The mirror image.
+- **GC last, never fatally.** This is also what drops a superseded primary's
+  bytes. A failed index write reports `published:false` and leaves the orphaned
+  blob in place *deliberately* — same reasoning as books. Find any that
+  accumulate with
+  `npx wrangler kv key list --binding MAILBOX_KV --prefix 'box:<id>:wallpaper'`.
+
+A stored entry is re-validated on **read** and dropped unless the id, the target
+*and* the filename all round-trip through their validators unchanged — so a
+corrupted value can never emit a forged line, an off-contract target, or a
+`primary` carrying a name. A corrupt or unreadable index degrades to **nothing
+pending** (a normal wake), never a 500.
+
+`stat`/`getRange` apply here exactly as
+[they do for books](#statgetrange-the-optional-half-of-the-store-contract), and a
+test pins that both paths serve identical bytes for the same range.
+
+---
+
 ## Deploy
 
 Requires a Cloudflare account. `wrangler` is **not** a dependency of this repo —
@@ -300,6 +461,21 @@ curl -sS -X POST "$BASE/books" -H "Authorization: Bearer $TOKEN" \
 curl -sS "$BASE/books.txt"
 curl -sS -r 16384- "$BASE/books/deploy-check" -o /tmp/tail.bin -D - | grep -i content-range
 curl -sS -X DELETE "$BASE/books/deploy-check" -H "Authorization: Bearer $TOKEN"
+
+# wallpapers: a primary, a set item, and the supersede rule
+head -c 40000 /dev/urandom > /tmp/sleep.bmp
+curl -sS -X POST "$BASE/wallpaper" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'X-Wallpaper-Id: deploy-wp-1' -H 'X-Wallpaper-Target: primary' \
+  --data-binary @/tmp/sleep.bmp
+curl -sS -X POST "$BASE/wallpaper" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'X-Wallpaper-Id: deploy-wp-2' -H 'X-Wallpaper-Target: set' \
+  -H 'X-Filename: Deploy Check.bmp' --data-binary @/tmp/sleep.bmp
+curl -sS "$BASE/wallpaper.txt"          # newest LAST; primary's filename field is "-"
+curl -sS -r 16384- "$BASE/wallpaper/deploy-wp-1" -o /tmp/tail.bin -D - | grep -i content-range
+curl -sS -X DELETE "$BASE/wallpaper/deploy-wp-1" -H "Authorization: Bearer $TOKEN"
+curl -sS -X DELETE "$BASE/wallpaper/deploy-wp-2" -H "Authorization: Bearer $TOKEN"
 ```
 
 **`wrangler dev` is not the same thing as the local dev server below** — it needs
@@ -345,12 +521,13 @@ treat the base URL like a password:
 
 - it is stored in the reader's settings in clear, and is readable from the
   reader's own web UI (`GET /api/settings`) by anyone on that LAN;
-- **it is the read capability for the books too.** Anyone with the URL can list
-  `books.txt` and download every epub in the box, so treat a shared base URL as
-  sharing the library, not just the current note;
+- **it is the read capability for the books and the wallpapers too.** Anyone with
+  the URL can list `books.txt` / `wallpaper.txt` and download every epub and every
+  pending sleep screen in the box, so treat a shared base URL as sharing the
+  library and the imagery, not just the current note;
 - to revoke, mint a new box id and re-provision the reader. An old box costs at
-  most three note KV keys plus a manifest and up to `MAX_BOOKS` blobs; list and
-  delete them with
+  most three note KV keys plus two manifests, up to `MAX_BOOKS` epub blobs and up
+  to `MAX_WALLPAPERS` BMP blobs; list and delete them with
   `npx wrangler kv key list --binding MAILBOX_KV --prefix 'box:<id>:'` then
   `npx wrangler kv key delete --binding MAILBOX_KV '<key>'` for each. (The frame
   keys carry the note id, so the prefix listing is the reliable way to find
@@ -465,7 +642,8 @@ For anything longer-lived than a smoke test:
 
 Bounds — this repo has stalled its host with unbounded node processes before:
 request bodies capped **per route** (64 KB for the note routes, `MAX_BOOK_BYTES`
-for `POST /books`, chosen by `core.js`'s `requestBodyLimit`; bytes past the cap
+for `POST /books`, `MAX_WALLPAPER_BYTES` for `POST /wallpaper`, chosen by
+`core.js`'s `requestBodyLimit`; bytes past the cap
 are discarded as they arrive and the request is answered **413** with
 `Connection: close`, so a client learns why), exactly one box id served (so no
 number of published ids widens it), single process, bounded
@@ -477,12 +655,13 @@ under a supervisor that owns the lifetime.
 torn write can never leave a half-frame readable and the frame-then-pointer
 ordering survives a crash.
 
-> **Prefer `--data-dir` once books are in play.** The file store reads a book
-> **range** straight off the disk, so resuming a 24 MB epub costs the window
-> asked for, not the whole file. The in-memory store keeps every book resident,
-> so its worst case is `MAX_BOOKS` x `MAX_BOOK_BYTES` (20 x 24 MB) plus a frame —
-> and the devbox systemd unit sets `MemoryMax=256M`, which is enough for one
-> upload at a time but not for a resident library.
+> **Prefer `--data-dir` once books or wallpapers are in play.** The file store
+> reads a **range** straight off the disk, so resuming a 24 MB epub (or a 1.1 MB
+> BMP) costs the window asked for, not the whole file. The in-memory store keeps
+> every blob resident, so its worst case is `MAX_BOOKS` x `MAX_BOOK_BYTES`
+> (20 x 24 MB) plus `MAX_WALLPAPERS` x `MAX_WALLPAPER_BYTES` (8 x 4 MB) plus a
+> frame — and the devbox systemd unit sets `MemoryMax=256M`, which is enough for
+> one upload at a time but not for a resident library.
 
 ## Tests
 

@@ -414,12 +414,38 @@ export type ReaderLinkModuleEvents = {
     onWifiShare: (event: WifiShareEvent) => void;
 };
 
+/**
+ * Why the phone's own network name is or is not known. Mirrors the reason codes
+ * in `CurrentSsid.kt`; `src/services/wifi_ssid.ts` maps them to what the
+ * WiFi-share card shows.
+ */
+export type CurrentSsidReason = 'ok' | 'permission' | 'unavailable' | 'no-wifi';
+
+export type CurrentSsidResult = {
+    /** The network name, quotes already stripped, or null. */
+    ssid: string | null;
+    reason: CurrentSsidReason;
+};
+
 declare class ReaderLinkNativeModule extends NativeModule<ReaderLinkModuleEvents> {
     joinReaderAp(options: JoinReaderApOptions): Promise<JoinReaderApResult>;
     leaveReaderAp(): Promise<{ ok: boolean }>;
     startProxy(options: StartProxyOptions): Promise<StartProxyResult>;
     stopProxy(): Promise<{ ok: boolean }>;
     getStatus(): Promise<ReaderLinkStatus>;
+    /**
+     * Name of the Wi-Fi network THIS PHONE is on. NEVER REJECTS, and touches no
+     * session state: it is a plain read, valid whether or not a sync has ever
+     * run. Needs ACCESS_FINE_LOCATION, which the app requests from exactly one
+     * button (see `src/services/android_permissions.ts`).
+     *
+     * ABSENT FROM ANY DEV CLIENT BUILT BEFORE THIS FUNCTION LANDED, which is why
+     * `src/services/wifi_ssid.ts` resolves it independently and tolerantly
+     * instead of going through `src/services/reader_link.ts` — that file treats
+     * a missing method as "the whole module is missing" so a drift fails loudly
+     * mid-sync, and a prefill must not be able to trip that.
+     */
+    getCurrentSsid(): Promise<CurrentSsidResult>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -461,6 +487,21 @@ export function stopProxy(): Promise<{ ok: boolean }> {
 
 export function getStatus(): Promise<ReaderLinkStatus> {
     return requireModule().getStatus();
+}
+
+/**
+ * Current network name, or a reason there is none.
+ *
+ * DEGRADES instead of throwing, unlike every other wrapper in this file: a build
+ * without the module (or an older one without this function) reports
+ * `unavailable`, because the caller is a settings card whose fallback is a field
+ * the user types into, not a session that must fail loudly.
+ */
+export function getCurrentSsid(): Promise<CurrentSsidResult> {
+    if (!nativeModule || typeof nativeModule.getCurrentSsid !== 'function') {
+        return Promise.resolve({ ssid: null, reason: 'unavailable' });
+    }
+    return nativeModule.getCurrentSsid();
 }
 
 // ---------------------------------------------------------------------------------------------
