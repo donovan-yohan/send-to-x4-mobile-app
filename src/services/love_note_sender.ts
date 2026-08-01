@@ -323,10 +323,25 @@ export interface SendLoveNoteFrameOptions {
     noteId?: string;
     /**
      * `false` reproduces the pre-sidecar behaviour: the frame is written and NO
-     * id is staged, so the firmware treats the note as legacy/always-unread and
-     * re-shows it on every wake. Diagnostics only — `current.id` is still
-     * DELETED, because leaving the previous note's id behind would suppress this
-     * frame entirely rather than merely re-show it.
+     * id is staged. Diagnostics only — `current.id` is still DELETED, because
+     * leaving the previous note's id behind would suppress this frame entirely.
+     *
+     * STALE-CLAIM CORRECTION, and it applies to every "on every wake" phrase
+     * left in this file (the `idStaged` doc below, the `stageId=false` console
+     * line, and the user-facing `idError` sentence). Those describe the ROUND-1
+     * firmware, where an id-less frame was always-unread and therefore held the
+     * panel on every wake. Under the shipped display-once model
+     * (docs/xteink/mailbox-books-contract.md §3A, "Reversion rule") an id-less
+     * frame is treated as UNSEEN and gets exactly ONE turn like any other note:
+     * `MessageSync::markStagedNoteDisplayed()` mints a `local-{millis}` key into
+     * `/.love-notes/current.id` at the moment of the paint, so the turn is
+     * consumed and the configured wallpaper returns at the next sleep. A frame
+     * whose sidecar upload failed is therefore a cosmetic degradation (History
+     * cannot name the id), NOT a note pinned to the panel.
+     *
+     * The `idError` string is not corrected here because it is asserted by
+     * `scripts/love-note-sender.test.js` (`assert.match(result.idError,
+     * /every wake/i)`); rewording it is a lockstep copy + test change.
      */
     stageId?: boolean;
 }

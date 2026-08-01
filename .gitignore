@@ -48,3 +48,6 @@ design/
 *.aab
 *.apk
 test-frames/
+# Internal session/handoff notes — device serials, LAN/tailnet addresses, host names.
+# Public docs live in README.md and docs/SETUP.md.
+HANDOFF.md
